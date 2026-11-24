@@ -1,0 +1,32 @@
+logs/
+__pycache__/
+*.pyc
+*.pyo
+.idea/
+.venv/
+venv/
+net10.0-windows/
+build/
+dist/
+release/
+# 本地快捷启动方式
+*启动*.command
+*配置*.command
+# 个人配置、密钥与备份（严禁提交到公开仓库）
+config.json
+config.real.json
+config.test.json
+config.backup-*.json
+config-backups/
+voice_profiles/
+*.wav
+*.mp3
+.vscode/
+# 测试与临时排查产物
+test_*.py
+.pytest_cache/
+output/
+/.tmp/
+pip-*/
+unipus-workbench-*/
+unicampus-workbench-*/

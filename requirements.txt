@@ -1,0 +1,10 @@
+selenium>=4.10.0
+openai>=1.10.0
+openai-whisper>=20231117
+# 录音题（Exercise 2 主观题）TTS 主后端；没装会回退到 Windows 自带 System.Speech
+edge-tts>=7.3.1
+# Native Qt Quick interface. Essentials includes QML/Quick/Controls without WebEngine.
+PySide6-Essentials>=6.8,<7
+# 「我的音色」麦克风实时录音、试听播放与进程内音频编解码
+sounddevice>=0.5.0
+av>=12.0.0
