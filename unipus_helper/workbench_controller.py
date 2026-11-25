@@ -2,20 +2,18 @@
 from __future__ import annotations
 
 import copy
-import json
 import queue
 import re
 import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 from collections import defaultdict
 from datetime import datetime
 from types import SimpleNamespace
 
 from .course_catalog import CourseCatalogMixin
+from .model_api import probe_model
 from .task_grading import MIN_TASK_SCORE, needs_live_conversation, score_text, selectable_task
 
 
@@ -58,47 +56,24 @@ class WorkbenchController(CourseCatalogMixin):
         self._completed = 0
         self._total = 0
         self._api_status, self._api_ok, self._api_fail = "正在检测接口", False, False
+        self._api_config_error = False
         self._log_worker = threading.Thread(target=self._collect_logs, daemon=True, name="workbench-logs")
         self._log_worker.start()
         threading.Thread(target=self._probe_api, daemon=True, name="workbench-api").start()
 
-    def _api_request(self, config):
-        """发一个最小的对话请求，返回耗时；异常原样抛出。"""
-        base = str(getattr(config, "base_url", "") or "").rstrip("/")
-        payload = json.dumps({
-            "model": getattr(config, "model", "") or "",
-            "messages": [{"role": "user", "content": "ping"}],
-            "max_tokens": 1,
-        }).encode("utf-8")
-        request = urllib.request.Request(
-            base + "/chat/completions", data=payload, method="POST",
-            headers={"Content-Type": "application/json",
-                     "Authorization": "Bearer " + str(getattr(config, "api_key", "") or "")})
-        started = time.monotonic()
-        with urllib.request.urlopen(request, timeout=15) as response:
-            response.read(64)
-        return (time.monotonic() - started) * 1000
-
     def _probe_api(self):
         config = getattr(self.bot, "config", None)
-        base = str(getattr(config, "base_url", "") or "").strip()
-        key = str(getattr(config, "api_key", "") or "").strip()
-        if not base or not key:
-            status, ok, fail = "未配置 API", False, False
-        else:
-            probe = getattr(self, "_api_request", None)
-            try:
-                elapsed = probe(config) if probe else 0
-                status, ok, fail = "接口正常 · %.1f s" % (elapsed / 1000), True, False
-            except urllib.error.HTTPError as exc:
-                hidden = exc.code in (401, 403)
-                status, ok, fail = ("API Key 无效 · %d" % exc.code if hidden
-                                    else "接口异常 · %d" % exc.code), False, True
-            except Exception as exc:  # noqa: BLE001
-                status, ok, fail = "接口连不上 · %s" % type(exc).__name__, False, True
+        base, key, model = (getattr(config, name, "") for name in ("base_url", "api_key", "model"))
+        result = probe_model(base, key, model)
         with self._lock:
-            self._api_status, self._api_ok, self._api_fail = status, ok, fail
-            self._add_log("模型接口检测：%s" % status, "success" if ok else "warning" if fail else "info")
+            if self._closed.is_set():
+                return
+            self._api_status = result.message if config is not None else "未配置 API"
+            self._api_ok = result.ok
+            self._api_fail = config is not None and not result.ok
+            self._api_config_error = config is not None and result.config_error
+            level = "success" if self._api_ok else "warning" if self._api_fail else "info"
+            self._add_log(f"模型接口检测：{self._api_status}", level)
 
     @staticmethod
     def after(ms, callback):
@@ -216,6 +191,8 @@ class WorkbenchController(CourseCatalogMixin):
         with self._lock:
             if self._closed.is_set() or not self._ready or self._operation:
                 return {"ok": False, "error": "请等待登录或当前操作完成。"}
+            if action in ("run", "quick") and self._api_config_error:
+                return {"ok": False, "error": self._api_status + "。保存模型配置后重新打开工作台。"}
             selected = []
             if action == "run":
                 selected_ids = self._selected if task_ids is None else self._selected.intersection(task_ids)

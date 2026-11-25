@@ -18,6 +18,7 @@ from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 from shiboken6 import delete as delete_qt_object
 
+from .model_api import model_settings_error, probe_model
 from .paths import PROJECT_ROOT, QML_DIR
 from .task_grading import score_text
 from .workbench_controller import WorkbenchController
@@ -90,6 +91,9 @@ def save_config(path, data: dict):
 class ConfigEditor(QObject):
     saved = Signal(str, bool)
     valuesChanged = Signal()
+    apiTestingChanged = Signal()
+    apiTestFinished = Signal(str, bool)
+    _apiTestResult = Signal(str, bool)
 
     def __init__(self, path, first_run=False, on_saved=None):
         super().__init__()
@@ -98,6 +102,8 @@ class ConfigEditor(QObject):
         self.completed = False
         self._on_saved = on_saved
         self.cfg = load_config(path)
+        self._api_testing = False
+        self._apiTestResult.connect(self._finish_api_test, Qt.ConnectionType.QueuedConnection)
 
     @Property("QVariantMap", notify=valuesChanged)
     def values(self):
@@ -107,12 +113,38 @@ class ConfigEditor(QObject):
     def firstRun(self):
         return self.first_run
 
+    @Property(bool, notify=apiTestingChanged)
+    def apiTesting(self):
+        return self._api_testing
+
+    @Slot("QVariantMap")
+    def testApi(self, values):
+        if self._api_testing:
+            return
+        settings = tuple(str(values.get(name) or "").strip() for name in ("base_url", "api_key", "model"))
+        self._api_testing = True
+        self.apiTestingChanged.emit()
+
+        def run_test():
+            result = probe_model(*settings)
+            self._apiTestResult.emit(result.message, result.ok)
+
+        threading.Thread(target=run_test, name="settings-api", daemon=True).start()
+
+    @Slot(str, bool)
+    def _finish_api_test(self, message, ok):
+        self._api_testing = False
+        self.apiTestingChanged.emit()
+        self.apiTestFinished.emit(message, ok)
+
     def refresh_from_disk(self):
         self.cfg = load_config(self.path)
         self.valuesChanged.emit()
 
     @Slot("QVariantMap")
     def save(self, values):
+        if self._api_testing:
+            return
         # Always merge on top of latest disk config so voice settings edited in VoiceStudio are preserved
         data = load_config(self.path)
         data.update(values)
@@ -130,16 +162,26 @@ class ConfigEditor(QObject):
         if missing:
             self.saved.emit("请填写必填项：" + "、".join(missing), False)
             return
+        error = model_settings_error(data["base_url"], data["api_key"], data["model"])
+        if error:
+            self.saved.emit(error, False)
+            return
         for key in _BOOL_KEYS:
             data[key] = bool(data.get(key, DEFAULT_CONFIG[key]))
         try:
             data["max_tokens"] = int(data["max_tokens"])
-        except (ValueError, TypeError):
-            data["max_tokens"] = 32768
+            if data["max_tokens"] < 1:
+                raise ValueError
+        except (ValueError, TypeError, OverflowError):
+            self.saved.emit("最大 Token 数必须是正整数", False)
+            return
         try:
             data["temperature"] = float(data["temperature"])
+            if not 0 <= data["temperature"] <= 2:
+                raise ValueError
         except (ValueError, TypeError):
-            data["temperature"] = 0.3
+            self.saved.emit("温度必须在 0 到 2 之间", False)
+            return
         try:
             data["voice_clone_tau"] = max(0.10, min(0.85, float(data.get("voice_clone_tau", 0.35))))
         except (ValueError, TypeError):
@@ -162,7 +204,7 @@ class ConfigEditor(QObject):
                 self._on_saved(data)
             except Exception:
                 pass
-        self.saved.emit("配置已保存" if self.first_run else "配置已保存（语音设置已实时生效，账号/浏览器项重启后生效）", True)
+        self.saved.emit("配置已保存" if self.first_run else "配置已保存。语音设置实时生效，模型、账号和浏览器设置重启后生效。", True)
 
 
 def setup_first_run():

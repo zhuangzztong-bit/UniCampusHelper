@@ -92,7 +92,10 @@ from unipus_helper.course_catalog import CourseCatalogMixin
 from unipus_helper.environment_checker import EnvironmentChecker
 from unipus_helper.meta import APP_NAME, APP_VERSION, GITHUB_DISPLAY, GITHUB_URL
 from unipus_helper.task_grading import MIN_TASK_SCORE, confirmed_score, needs_live_conversation
-from openai import OpenAI
+from unipus_helper.model_api import (
+    MODEL_REQUEST_TIMEOUT, MODEL_RETRY_BUDGET, describe_model_error, make_model_client,
+    model_error_retryable, model_error_status,
+)
 from selenium.common.exceptions import (NoSuchDriverException, NoSuchElementException,
                                         NoSuchFrameException, TimeoutException,
                                         StaleElementReferenceException, SessionNotCreatedException,
@@ -978,7 +981,7 @@ class OpenAICompatibleClient:
 
     def __init__(self, config: Config):
         self.config = config
-        self.client = OpenAI(api_key=config.api_key, base_url=config.base_url)
+        self.client = make_model_client(config.base_url, config.api_key)
         self.conversation_history: List[Dict] = []
         self.material_messages: List[Dict] = []  # 材料独立保留，不随问答窗口裁剪
         self.current_chapter_id: Optional[str] = None
@@ -1050,161 +1053,111 @@ class OpenAICompatibleClient:
     def ask(self, prompt: str, retry_count: int = 3, stop_requested: Optional[threading.Event] = None,
             screenshot: Optional[bytes] = None, remember: bool = True,
             require_image: bool = False) -> Optional[str]:
-        """发送问题并获取回答
-
-        推理型模型（如 deepseek-flash）可能把 max_tokens 全部消耗在 reasoning 上，
-        导致 content 为空且 finish_reason=length；这里在重试次数内调整预算和问法。
-        """
+        """Retry recoverable failures within the configured output limit and retry budget."""
+        try:
+            max_tokens = max(1, int(self.config.max_tokens))
+        except (ValueError, TypeError, OverflowError):
+            max_tokens = 32768
+        deadline = time.monotonic() + MODEL_RETRY_BUDGET
         print(f"当前ai对话历史共{len(self.conversation_history)}条")
-        # 推理型模型会把预算全烧在 reasoning 上，配置值太小时必然拿不到正文；
-        # 这里设一个下限，配置里写得更小也按 32768 走。
-        max_tokens = max(self.config.max_tokens, 32768)
+
         for attempt in range(retry_count):
             if stop_requested is not None and stop_requested.is_set():
                 return None
-            try:
-                ask_prompt = prompt
-                if attempt > 0:
-                    # 上一轮被推理吃光了预算，第二次直接要求给结论，别绕弯
-                    ask_prompt = prompt + "\n\n【重要】请直接给出最终答案，不要输出推理过程，不要解释。"
-                user_message: Dict[str, Any] = {"role": "user", "content": ask_prompt}
-                if screenshot:
-                    user_message = {"role": "user", "content": [
-                        {"type": "text", "text": ask_prompt},
-                        {"type": "image_url", "image_url": {
-                            "url": "data:image/png;base64," +
-                                   base64.b64encode(screenshot).decode('ascii')}},
-                    ]}
-                messages = [
-                    {"role": "system", "content": self.SYSTEM_PROMPT},
-                    *getattr(self, 'material_messages', []),
-                    *self.conversation_history,
-                    user_message,
+            if time.monotonic() >= deadline:
+                break
+            ask_prompt = prompt
+            if attempt:
+                ask_prompt += "\n\n【重要】请直接给出最终答案，不要输出推理过程，不要解释。"
+            user_message: Dict[str, Any] = {"role": "user", "content": ask_prompt}
+            if screenshot:
+                user_message["content"] = [
+                    {"type": "text", "text": ask_prompt},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64," +
+                                                       base64.b64encode(screenshot).decode("ascii")}},
                 ]
-
-                if DEBUG_MODE:
-                    print("\n" + "=" * 60)
-                    print(" [DEBUG] API 请求详情")
-                    print(f"   base_url: {self.config.base_url}")
-                    print(f"   model:    {self.config.model}")
-                    print(f"   temperature: {self.config.temperature}")
-                    print(f"   max_tokens:  {max_tokens}")
-                    print(f"   消息条数: {len(messages)}")
-                    for i, msg in enumerate(messages):
-                        role = msg["role"]
-                        content = msg["content"]
-                        preview = content[:300] + "..." if len(content) > 300 else content
-                        print(f"   [{i}] {role}: {preview}")
-                    print("=" * 60 + "\n")
-
-                # 推理型模型思考时可能几十秒没有输出，先明确告诉用户「已经发出去了」，
-                # 否则界面空白会让人以为脚本卡死。
-                shot = f"，附截图 {len(screenshot) // 1024} KB" if screenshot else ""
-                print(f"【请求】已向 AI 发送请求（{len(ask_prompt)} 字{shot}，max_tokens={max_tokens}，"
-                      f"第 {attempt + 1}/{retry_count} 次），等待 {self.config.model} 返回...")
-                request_started = time.time()
-
-                # 有的模型/网关不接受超大 max_tokens，报错就减半重试，别整题失败
-                request_tokens = max_tokens
-                while True:
-                    try:
-                        response = self.client.chat.completions.create(
-                            model=self.config.model,
-                            messages=messages,
-                            temperature=self.config.temperature,
-                            max_tokens=request_tokens
-                        )
-                        break
-                    except Exception as exc:
-                        message = str(exc).lower()
-                        rejects_budget = ('max_tokens' in message or 'max output' in message
-                                          or 'too large' in message or 'maximum context' in message)
-                        if rejects_budget and request_tokens > 4096:
-                            print(f"    模型不接受 max_tokens={request_tokens}，减半到 {request_tokens // 2} 重试")
-                            request_tokens //= 2
-                            continue
-                        raise
-                max_tokens = request_tokens
-
-                elapsed = time.time() - request_started
-                finish_reason = response.choices[0].finish_reason
-                answer = (response.choices[0].message.content or "").strip()
-                print(f"【返回】AI 已返回（耗时 {elapsed:.1f}s，finish_reason={finish_reason}，"
-                      f"{len(answer)} 字）")
-
-                if DEBUG_MODE:
-                    print("\n" + "=" * 60)
-                    print(" [DEBUG] API 响应详情")
-                    print(f"   model:        {response.model}")
-                    print(f"   finish_reason:{finish_reason}")
-                    print(f"   usage:        {response.usage}")
-                    print(f"   answer:       {answer[:500]}{'...' if len(answer) > 500 else ''}")
-                    print("=" * 60 + "\n")
-
-                if not answer:
-                    if finish_reason == 'length':
-                        if attempt == retry_count - 1:
-                            print("推理耗尽 token，已达到最大重试次数")
-                            return None
-                        if max_tokens < 32768:
-                            max_tokens = min(max_tokens * 2, 32768)
-                        print(f"推理耗尽 token（finish_reason=length），使用 max_tokens="
-                              f"{max_tokens} 和简化问法重试")
-                        continue
-                    print(f"模型返回空内容（finish_reason={finish_reason}）")
+            messages = [
+                {"role": "system", "content": self.SYSTEM_PROMPT},
+                *getattr(self, "material_messages", []),
+                *self.conversation_history,
+                user_message,
+            ]
+            shot = f"，附截图 {len(screenshot) // 1024} KB" if screenshot else ""
+            print(f"【请求】{self.config.model}（{len(ask_prompt)} 字{shot}，max_tokens={max_tokens}，"
+                  f"第 {attempt + 1}/{retry_count} 次）")
+            request_started = time.monotonic()
+            try:
+                remaining = deadline - request_started
+                if remaining <= 0:
+                    break
+                response = self.client.chat.completions.create(
+                    model=self.config.model,
+                    messages=messages,
+                    temperature=self.config.temperature,
+                    max_tokens=max_tokens,
+                    timeout=min(MODEL_REQUEST_TIMEOUT, remaining),
+                )
+                if stop_requested is not None and stop_requested.is_set():
                     return None
-
+                choices = getattr(response, "choices", None)
+                if not isinstance(choices, (list, tuple)) or not choices:
+                    print("模型未返回有效作答数据，请检查 API 地址和响应格式")
+                    return None
+                choice = choices[0]
+                finish_reason = choice.finish_reason
+                answer = (choice.message.content or "").strip()
+                elapsed = time.monotonic() - request_started
+                print(f"【返回】AI 已返回（耗时 {elapsed:.1f}s，finish_reason={finish_reason}，{len(answer)} 字）")
+                usage = getattr(response, "usage", None)
+                if usage is not None:
+                    print(f"模型用量：输入 {getattr(usage, 'prompt_tokens', 0)} Token，"
+                          f"输出 {getattr(usage, 'completion_tokens', 0)} Token")
+                if not answer:
+                    if finish_reason == "length" and attempt + 1 < retry_count:
+                        print("模型耗尽本次输出预算，使用简化问法重试")
+                        continue
+                    print(f"模型未返回正文（finish_reason={finish_reason}）")
+                    return None
                 if remember:
-                    self.conversation_history.append({"role": "user", "content": prompt})
-                    self.conversation_history.append({"role": "assistant", "content": answer})
-
+                    self.conversation_history.extend((
+                        {"role": "user", "content": prompt},
+                        {"role": "assistant", "content": answer},
+                    ))
                     self.conversation_history = self.conversation_history[-20:]
-
                 print(f"AI回答: {answer}")
                 return answer
-
-            except Exception as e:
-                if screenshot is not None and self._is_image_unsupported_error(e):
+            except Exception as exc:
+                if stop_requested is not None and stop_requested.is_set():
+                    return None
+                error = describe_model_error(exc)
+                if screenshot is not None and self._is_image_unsupported_error(exc):
                     if require_image:
-                        print("   接口无法识别题目图片，停止作答")
+                        print("接口无法识别本题所需图片")
                         return None
-                    screenshot = None
-                    print("   接口拒绝图片，改用纯文本重试")
-                if DEBUG_MODE:
-                    import traceback
-                    print("\n" + "=" * 60)
-                    print(" [DEBUG] API 调用异常详情")
-                    print(f"   异常类型: {type(e).__name__}")
-                    print(f"   异常信息: {e}")
-                    if hasattr(e, 'response'):
-                        try:
-                            print(f"   HTTP 状态码: {e.response.status_code}")
-                            print(f"   响应头: {dict(e.response.headers)}")
-                            print(f"   响应体: {e.response.text[:1000]}")
-                        except:
-                            pass
-                    if hasattr(e, 'body'):
-                        try:
-                            print(f"   错误body: {e.body}")
-                        except:
-                            pass
-                    if hasattr(e, 'status_code'):
-                        print(f"   status_code: {e.status_code}")
-                    print(f"   完整堆栈:")
-                    traceback.print_exc()
-                    print("=" * 60 + "\n")
-
-                if attempt < retry_count - 1:
-                    delay = (2 ** attempt) + random.random()
-                    if stop_requested is not None:
-                        if stop_requested.wait(delay):
-                            return None
-                    else:
-                        time.sleep(delay)
-                error_msg = str(e)
-                print(f"AI调用失败: {error_msg[:50]}")  # 控制台只显示简短信息
-                logger.error(f"详细错误: {error_msg}", exc_info=True)  # 详细堆栈保存到文件
-
+                    if attempt + 1 < retry_count:
+                        screenshot = None
+                        print("接口拒绝图片，使用文本重试")
+                        continue
+                message = str(exc).lower()
+                if (model_error_status(exc) in (400, 422) and max_tokens > 4096
+                        and ("max_tokens" in message or "max output" in message)
+                        and attempt + 1 < retry_count):
+                    max_tokens //= 2
+                    print(f"接口拒绝当前输出上限，减半至 {max_tokens} Token 重试")
+                    continue
+                if not model_error_retryable(exc) or attempt + 1 >= retry_count:
+                    print(f"AI调用失败：{error.message}")
+                    return None
+                delay = (2 ** attempt) + random.random()
+                if delay >= deadline - time.monotonic():
+                    break
+                print(f"AI调用暂时失败：{error.message}，{delay:.1f}s 后重试")
+                if stop_requested is not None:
+                    if stop_requested.wait(delay):
+                        return None
+                else:
+                    time.sleep(delay)
+        print("模型请求已达到重试时限或次数上限")
         return None
 
 
@@ -10318,10 +10271,7 @@ class VideoHandler(ContentHandler):
 
         self.transcriber = transcriber if transcriber is not None else AudioTranscriber()
 
-        self.analyzer_client = OpenAI(
-            api_key=config.api_key,
-            base_url=config.base_url
-        )
+        self.analyzer_client = make_model_client(config.base_url, config.api_key)
 
         self.video_transcript = ""
         self.current_video_url = ""

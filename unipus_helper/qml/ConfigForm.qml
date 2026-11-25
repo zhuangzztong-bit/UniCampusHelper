@@ -31,6 +31,10 @@ Item {
             root.noticeOk = ok
             if (ok) root.savedSuccess()
         }
+        function onApiTestFinished(message, ok) {
+            root.notice = message
+            root.noticeOk = ok
+        }
     }
 
     component FieldGroup: Rectangle {
@@ -123,6 +127,7 @@ Item {
 
         ScrollView {
             id: scroll
+            enabled: !configEditor.apiTesting
             Layout.fillWidth: true
             Layout.fillHeight: true
             clip: true
@@ -151,7 +156,7 @@ Item {
                     model: [
                         { key: "api_key", label: "API Key *", hint: "输入接口密钥", mono: true },
                         { key: "base_url", label: "API 地址 *", hint: "例如 https://api.deepseek.com/v1", mono: true },
-                        { key: "model", label: "模型名称 *", hint: "例如 deepseek-chat", mono: true },
+                        { key: "model", label: "模型名称 *", hint: "例如 deepseek-flash", mono: true },
                         { key: "max_tokens", label: "最大 Token 数", hint: "32768", mono: true },
                         { key: "temperature", label: "温度（0–2）", hint: "0.3", mono: true }
                     ]
@@ -250,27 +255,38 @@ Item {
 
         Rectangle {
             Layout.fillWidth: true
-            implicitHeight: 56
+            implicitHeight: Math.max(56, footer.implicitHeight + 18)
             radius: 10
             color: Theme.surface
             border.width: 1
             border.color: Theme.line
 
             RowLayout {
+                id: footer
                 anchors.fill: parent
                 anchors.leftMargin: 18; anchors.rightMargin: 16
                 spacing: 12
                 UiText {
-                    text: root.notice !== "" ? root.notice : "修改完成后点击保存；「我的音色」设置实时生效"
-                    color: root.notice === "" ? Theme.muted : root.noticeOk ? Theme.success : Theme.error
+                    text: configEditor.apiTesting ? "正在测试模型接口…" : root.notice
+                    color: configEditor.apiTesting ? Theme.muted : root.noticeOk ? Theme.success : Theme.error
                     Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
                     font.pixelSize: 13
+                }
+                ActionButton {
+                    objectName: "testApiButton"
+                    text: "测试连接"
+                    iconName: "refresh"
+                    enabled: !configEditor.apiTesting
+                    implicitHeight: 38
+                    onClicked: configEditor.testApi(root.collectValues())
                 }
                 ActionButton {
                     objectName: "saveButton"
                     text: "保存配置"
                     iconName: "check"
                     primary: true
+                    enabled: !configEditor.apiTesting
                     implicitHeight: 38
                     leftPadding: 20; rightPadding: 20
                     onClicked: root.saveSettings()
