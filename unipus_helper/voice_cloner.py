@@ -1051,7 +1051,11 @@ class OpenVoiceV2Converter:
                 with path.open("rb") as handle:
                     info = os.fstat(handle.fileno())
                     valid = self._matches_asset(handle, info, expected_size, expected_digest)
-                    self._asset_status[name] = (self._fingerprint(info), valid)
+                # Windows Python 3.12 can return different ctime values for stat and fstat.
+                # Cache the same path metadata used for future checks, only if it stayed stable.
+                if self._fingerprint(path.stat()) != signature:
+                    return False
+                self._asset_status[name] = (signature, valid)
                 return valid
             except OSError:
                 return False

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -160,7 +161,17 @@ class VoiceAssetTests(unittest.TestCase):
 
     def test_repeated_readiness_reuses_validation(self):
         self._write_local_assets()
-        with patch.object(voice_cloner.hashlib, "file_digest", wraps=hashlib.file_digest) as digest:
+        fstat = os.fstat
+
+        def different_ctime(descriptor):
+            info = fstat(descriptor)
+            values = {field: getattr(info, field) for field in
+                      ("st_mode", "st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")}
+            values["st_ctime_ns"] += 1000
+            return SimpleNamespace(**values)
+
+        with (patch.object(voice_cloner.hashlib, "file_digest", wraps=hashlib.file_digest) as digest,
+              patch.object(voice_cloner.os, "fstat", side_effect=different_ctime)):
             self.assertTrue(self.converter.is_downloaded())
             self.assertTrue(self.converter.is_downloaded())
             self.assertEqual(digest.call_count, len(self.assets))
