@@ -12904,14 +12904,14 @@ class AISolver:
                 return False
             # 注意：分批作答时 normal_questions 会被清空，是否提交要看 total_questions，
             # 否则「做完不交卷」，用户还得手动点提交。
+            legacy_unreviewed_url = self._legacy_unreviewed_url() if total_questions else ''
             if total_questions and self.executor.submit():
-                submitted = self._wait_for_submit_complete(timeout=18)
+                submitted = self._wait_for_submit_complete(timeout=18, legacy_unreviewed_url=legacy_unreviewed_url)
                 if self._should_stop():
                     return False
                 if submitted:
                     print(f"    已自动提交")
                 else:
-                    print(f"    提交未确认生效（提交按钮仍在页面上），保留为未完成")
                     self._last_task_partial = True
                     self.processed_hashes.discard(content_hash)
                     return False
@@ -15681,7 +15681,24 @@ class AISolver:
         except Exception:
             return ''
 
-    def _wait_for_submit_complete(self, timeout: int = 18) -> bool:
+    @staticmethod
+    def _has_legacy_review(text: str) -> bool:
+        labels = {line.strip() for line in text.splitlines()}
+        return {'答题情况', '继续学习'}.issubset(labels)
+
+    def _legacy_unreviewed_url(self) -> str:
+        """Record the current legacy task only if its result view is absent before clicking."""
+        try:
+            url = self.driver.current_url
+            if urlsplit(url).hostname == 'ucontent.unipus.cn':
+                body = self.driver.find_element(By.TAG_NAME, 'body').text
+                if not self._has_legacy_review(body):
+                    return url
+        except (ValueError, WebDriverException):
+            pass
+        return ''
+
+    def _wait_for_submit_complete(self, timeout: int = 18, *, legacy_unreviewed_url: str = '') -> bool:
         """等待本次提交的页面回执，课程完成状态随后由学习记录核验。"""
         if self.stop_requested.wait(0.35):
             return False
@@ -15714,6 +15731,11 @@ class AISolver:
                     if PublishPlayer.has_submission_status(body_text):
                         print("   已检测到提交回执提示，待学习记录确认")
                         return True
+                    if (legacy_unreviewed_url and self.driver.current_url == legacy_unreviewed_url
+                            and self._has_legacy_review(body_text)):
+                        self._submission_unconfirmed = True
+                        print("   已显示本次答题情况，待 U 校园学习记录确认")
+                        return False
 
             except Exception:
                 pass

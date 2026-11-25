@@ -145,11 +145,54 @@ def check_core_regressions() -> None:
     print("[PASS] Core Unit 4 & Unit 5 anti-regression suite passed")
 
 
+def check_legacy_submission_receipt() -> None:
+    import UnipusAI_Helper as uah
+
+    review_page = "答题情况\n客观题 正确 (1/1)\n继续学习"
+    task_url = "https://ucontent.unipus.cn/explorationpc_detail/pc.html#/lesson/exercise-1"
+    other_task_url = task_url.replace("exercise-1", "exercise-2")
+
+    def observe_review(before, after, url_after=task_url):
+        page = SimpleNamespace(text=before)
+        solver = uah.AISolver.__new__(uah.AISolver)
+        solver.driver = SimpleNamespace(current_url=task_url, find_element=lambda *_: page)
+        solver.stop_requested = SimpleNamespace(wait=lambda _: False)
+        solver._should_stop = lambda: False
+        solver._handle_confirm_dialog_detail = lambda: {}
+        solver._get_submit_button_state = lambda: "gone"
+        solver._read_task_score = lambda: None
+        solver._has_redo_button = lambda: False
+        solver._read_answer_analysis = lambda: ""
+        solver._post_submit_diagnostic = lambda: ""
+        solver._submission_unconfirmed = False
+
+        unreviewed_url = solver._legacy_unreviewed_url()
+        page.text = after
+        solver.driver.current_url = url_after
+        with patch("UnipusAI_Helper.time.time", side_effect=[0, 0, 2]), patch("builtins.print") as output:
+            accepted = solver._wait_for_submit_complete(timeout=1, legacy_unreviewed_url=unreviewed_url)
+        assert not accepted and solver._submission_unconfirmed, "Completion must await the platform record"
+        return [call.args[0] for call in output.call_args_list]
+
+    new_review_log = observe_review("提交", review_page)
+    assert any("已显示本次答题情况" in line for line in new_review_log), new_review_log
+    assert all("等待超时" not in line for line in new_review_log), new_review_log
+    for invalid in (
+        observe_review(review_page, review_page),
+        observe_review("提交", "继续学习"),
+        observe_review("提交", review_page, other_task_url),
+    ):
+        assert any("等待超时" in line for line in invalid), invalid
+        assert all("已显示本次答题情况" not in line for line in invalid), invalid
+    print("[PASS] Legacy result transition waits for the platform record")
+
+
 def main() -> int:
     check_py_compile()
     check_metadata_and_branding()
     check_qml_zero_warnings_and_preview()
     check_core_regressions()
+    check_legacy_submission_receipt()
     print("=== ALL UniCampusHelper v4.0.0 RELEASE CHECKS PASSED ===")
     return 0
 
