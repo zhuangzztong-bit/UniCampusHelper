@@ -55,6 +55,8 @@ class WorkbenchController(CourseCatalogMixin):
         self._exclude_ungraded = False
         self._completed = 0
         self._total = 0
+        self._started = 0
+        self._active_task = ""
         self._api_status, self._api_ok, self._api_fail = "正在检测接口", False, False
         self._api_config_error = False
         self._log_worker = threading.Thread(target=self._collect_logs, daemon=True, name="workbench-logs")
@@ -146,7 +148,8 @@ class WorkbenchController(CourseCatalogMixin):
                 "tasks": tasks, "logs": self._logs, "account": account,
                 "model": getattr(config, "model", "") or "未配置",
                 "apiStatus": self._api_status, "apiOk": self._api_ok, "apiFail": self._api_fail,
-                "progress": {"completed": self._completed, "total": self._total},
+                "progress": {"completed": self._completed, "total": self._total,
+                             "started": self._started, "activeTask": self._active_task},
             })
 
     def set_selection(self, ids, selected):
@@ -203,6 +206,8 @@ class WorkbenchController(CourseCatalogMixin):
             self._operation = action
             self._error = ""
             self._completed = 0
+            self._started = 0
+            self._active_task = ""
             self._total = len(selected)
             self._stop_requested.clear()
             if self.solver:
@@ -232,38 +237,12 @@ class WorkbenchController(CourseCatalogMixin):
                     self._selected = {t["id"] for t in tasks if t.get("is_compulsory")
                                       and t.get("status") != "done" and selectable_task(t, self._exclude_ungraded)}
                 self._add_log(f"扫描完成，共发现 {len(tasks)} 项任务。", "success")
+            elif action == "run":
+                self._run_selected_tasks(selected)
             else:
-                if action == "run":
-                    for task in selected:
-                        task.pop("_publish_redo_attempted", None)
-                    self.solver.process_selected_tabs(selected, on_task_done=self._task_done)
-                    aborted = getattr(self.solver, "_aborted_by_errors", False) is True
-                    if not self._is_stopped():
-                        unconfirmed = self._verify_task_records(selected)
-                        retryable = [task for task in (unconfirmed or [])
-                                     if self._can_retry_after_verification(task)]
-                        if retryable and not aborted and not self._is_stopped():
-                            self._add_log(f"平台记录确认仍有 {len(retryable)} 项作答或音视频待处理，补做一轮。", "warning")
-                            with self._lock:
-                                self._status = "正在补做未确认任务"
-                            clear_media = getattr(self.solver, "clear_watched_media_for_task", None)
-                            if clear_media is not None:
-                                for task in retryable:
-                                    media = [g for g in task.get("_record_groups") or []
-                                             if g["kind"] in ("video", "audio")]
-                                    if (task.get("_record_matched") and media
-                                            and all(g["progress"] != 100 for g in media)):
-                                        clear_media(task.get("l1_title") or "",
-                                                    scope_key=task.get("_media_scope_key") or "")
-                            self.solver.process_selected_tabs(retryable, on_task_done=self._task_done)
-                            if not self._is_stopped():
-                                unconfirmed = self._verify_task_records(selected)
-                        if unconfirmed is not None and not self._is_stopped():
-                            self._log_task_records(selected, unconfirmed)
-                else:
-                    self.solver.processed_hashes.clear()
-                    if not self.solver.solve_current_page() and not self.solver._should_stop():
-                        raise RuntimeError("当前页面未处理完成，请查看运行日志。")
+                self.solver.processed_hashes.clear()
+                if not self.solver.solve_current_page() and not self.solver._should_stop():
+                    raise RuntimeError("当前页面未处理完成，请查看运行日志。")
             with self._lock:
                 stopped = self._is_stopped()
                 self._status = "已停止" if stopped else "就绪"
@@ -280,7 +259,47 @@ class WorkbenchController(CourseCatalogMixin):
             if watcher is not None:
                 watcher.resume()
             with self._lock:
+                self._active_task = ""
                 self._operation = None
+
+    def _run_selected_tasks(self, selected):
+        started = {}
+
+        def on_started(task):
+            started[task["id"]] = task
+            with self._lock:
+                self._started = len(started)
+                self._active_task = task.get("l1_title") or task.get("display", "")
+
+        for task in selected:
+            task.pop("_publish_redo_attempted", None)
+        self.solver.process_selected_tabs(selected, on_task_done=self._task_done, on_task_started=on_started)
+        attempted = list(started.values())
+        unconfirmed = None
+        if not self._is_stopped() and not self._closed.is_set():
+            unconfirmed = self._verify_task_records(attempted)
+            retryable = [task for task in (unconfirmed or []) if self._can_retry_after_verification(task)]
+            if retryable and not getattr(self.solver, "_aborted_by_errors", False) and not self._is_stopped():
+                self._add_log(f"平台记录确认仍有 {len(retryable)} 项作答或音视频待处理，补做一轮。", "warning")
+                with self._lock:
+                    self._status = "正在补做未确认任务"
+                clear_media = getattr(self.solver, "clear_watched_media_for_task", None)
+                if clear_media is not None:
+                    for task in retryable:
+                        media = [g for g in task.get("_record_groups") or [] if g["kind"] in ("video", "audio")]
+                        if (task.get("_record_matched") and media and all(g["progress"] != 100 for g in media)):
+                            clear_media(task.get("l1_title") or "", scope_key=task.get("_media_scope_key") or "")
+                self.solver.process_selected_tabs(retryable, on_task_done=self._task_done, on_task_started=on_started)
+                if not self._is_stopped():
+                    unconfirmed = self._verify_task_records(attempted)
+        if self._closed.is_set() or not attempted:
+            return
+        if self._is_stopped():
+            unconfirmed = self._sync_tasks_from_server(attempted, after_stop=True)
+        if unconfirmed is not None:
+            self._log_task_records(attempted, unconfirmed)
+        self._add_log(f"本轮开始 {len(attempted)}/{len(selected)} 项，平台确认完成 {self._completed} 项。",
+                      "info" if unconfirmed is not None else "warning")
 
     def _is_stopped(self):
         return self._stop_requested.is_set() or (self.solver is not None and self.solver._should_stop())
@@ -354,21 +373,25 @@ class WorkbenchController(CourseCatalogMixin):
                     if self.logger:
                         self.logger.warning("%s", message)
 
-    def _sync_tasks_from_server(self, processed_tasks):
+    def _sync_tasks_from_server(self, processed_tasks, *, after_stop=False):
         """任务跑完后返回课程目录，用 U 校园真实状态回写界面，返回平台仍未确认完成的任务列表。"""
-        if not processed_tasks or self.driver is None:
+        if not processed_tasks or self.driver is None or self._closed.is_set():
             return None
         directory_url = next((t.get("_directory_url") for t in processed_tasks if t.get("_directory_url")), "")
         unit_indices = {t.get("_unit_idx") for t in processed_tasks if t.get("_unit_idx") is not None}
         if not directory_url or not unit_indices:
             return None
         with self._lock:
-            self._status = "正在核验平台状态"
+            self._active_task = ""
+            self._status = "已停止处理，正在核验平台状态" if after_stop else "正在核验平台状态"
         self._add_log("正在返回课程目录核验 U 校园真实完成状态…", "info")
         # 等待最后一条提交的后端学习记录落库
-        if self._stop_requested.wait(1.2):
+        wait_event = self._closed if after_stop else self._stop_requested
+        if wait_event.wait(1.2) or self._closed.is_set():
             return None
         server_tabs = self.refresh_units_from_server(directory_url, unit_indices)
+        if self._closed.is_set():
+            return None
         if not server_tabs:
             self._add_log("未能从课程目录读取平台状态，请手动点击「扫描当前单元」核对。", "warning")
             return None
@@ -419,9 +442,6 @@ class WorkbenchController(CourseCatalogMixin):
             suffix = f"，页面回执 {score_text(score)} 分" if score is not None else ""
             self._add_log(f"本轮已处理：{name}，待课程目录核验{suffix}", "info")
             return
-        with self._lock:
-            self._selected.discard(task["id"])
-            self._completed += 1
         if score is not None and score < MIN_TASK_SCORE:
             self._add_log(f"页面回执：{name} 得分 {score:g}，低于 {MIN_TASK_SCORE} 分目标", "warning")
         else:

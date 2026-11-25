@@ -11047,11 +11047,13 @@ class AISolver:
         return self.stop_requested.is_set()
 
     def process_selected_tabs(self, selected_tabs: List[Dict], chapter_name: str = "",
-                              on_task_done: Optional[Callable[[Dict], None]] = None):
+                              on_task_done: Optional[Callable[[Dict], None]] = None,
+                              *, on_task_started: Optional[Callable[[Dict], None]] = None):
         """
         按用户勾选的 Tab 列表逐个处理（自动模式）。
         selected_tabs: 完整的 tab dict 列表（来自扫描结果）
         on_task_done: 单个任务处理完后的回调，GUI 用它来取消勾选 / 更新状态
+        on_task_started: 在打开每个可处理任务前调用
         """
         if not chapter_name:
             chapter_name = "selected_chapter"
@@ -11083,6 +11085,8 @@ class AISolver:
             if needs_live_conversation(tab):
                 print("  实时语音对话，需在 U 校园手动完成")
                 continue
+            if on_task_started:
+                on_task_started(tab)
             try:
                 status = self._process_selected_tab(tab, task_idx, len(selected_tabs), chapter_name, course_home_url)
             except Exception as exc:

@@ -53,10 +53,11 @@ def check_metadata_and_branding() -> None:
 
 def check_qml_zero_warnings_and_preview() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6.QtCore import QUrl
+    from PySide6.QtCore import QMetaObject, QUrl
     from PySide6.QtGui import QGuiApplication
     from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtQuickControls2 import QQuickStyle
+    from unipus_helper.model_api import ModelCheck
     from unipus_helper.native_ui import ConfigEditor
 
     QQuickStyle.setStyle("Basic")
@@ -70,6 +71,35 @@ def check_qml_zero_warnings_and_preview() -> None:
     engine.rootContext().setContextProperty("configEditor", model)
     engine.load(QUrl.fromLocalFile(str(qml_dir / "ConfigEditor.qml")))
     assert engine.rootObjects(), "ConfigEditor.qml failed to instantiate"
+    window = engine.rootObjects()[0]
+
+    def find_item(item, name):
+        if item.objectName() == name:
+            return item
+        for child in item.childItems():
+            match = find_item(child, name)
+            if match is not None:
+                return match
+        return None
+
+    draft_model = find_item(window.contentItem(), "field_model")
+    test_button = find_item(window.contentItem(), "testApiButton")
+    assert draft_model is not None and test_button is not None
+    assert draft_model.setProperty("text", "Draft-Model")
+    replies = []
+    model.apiTestFinished.connect(lambda message, ok: replies.append((message, ok)))
+    with patch("unipus_helper.native_ui.probe_model", return_value=ModelCheck(True, "离线接口通过")) as probe:
+        assert QMetaObject.invokeMethod(test_button, "clicked")
+        # Qt 需处理来自探针线程的排队信号。
+        for _ in range(100):
+            app.processEvents()
+            if replies:
+                break
+            threading.Event().wait(0.01)
+        probe.assert_called_once()
+        assert probe.call_args.args[-1] == "Draft-Model"
+    assert replies == [("离线接口通过", True)] and not model.apiTesting
+    assert model.values["model"] != "Draft-Model", "API testing must leave saved configuration intact"
     for obj in engine.rootObjects():
         obj.close()
     assert not warnings, f"QML warnings detected: {warnings}"
@@ -187,12 +217,56 @@ def check_legacy_submission_receipt() -> None:
     print("[PASS] Legacy result transition waits for the platform record")
 
 
+def check_stopped_batch_verification() -> None:
+    from unipus_helper.workbench_controller import WorkbenchController
+
+    class Solver:
+        def __init__(self):
+            self.stopped = False
+            self.calls = 0
+
+        def request_stop(self):
+            self.stopped = True
+
+        def _should_stop(self):
+            return self.stopped
+
+        def process_selected_tabs(self, tasks, on_task_done, on_task_started):
+            self.calls += 1
+            on_task_started(tasks[0])
+            on_task_done(tasks[0])
+            progress = workbench.snapshot()["progress"]
+            assert progress == {"completed": 0, "total": 2, "started": 1, "activeTask": "First"}
+            workbench.stop()
+
+    url = "https://course.example.invalid/directory"
+    first, second = ({"id": str(idx), "l1_title": name, "status": "unknown", "section": "Section",
+                       "_directory_url": url, "_unit_idx": idx, "_submission_unconfirmed": True}
+                      for idx, name in enumerate(("First", "Second")))
+    solver = Solver()
+    with patch.object(threading.Thread, "start"):
+        workbench = WorkbenchController(driver=object(), solver=solver)
+    workbench._tasks = [first, second]
+    workbench._selected = {first["id"], second["id"]}
+    workbench._total = 2
+    workbench._operation = "run"
+    platform_record = dict(first, status="done", _record_matched=True, score=90.0, progress=100)
+    with patch.object(workbench, "refresh_units_from_server", return_value=[platform_record]) as refresh:
+        workbench._run_operation("run", [first, second])
+        refresh.assert_called_once_with(url, {first["_unit_idx"]})
+    assert solver.calls == 1 and workbench._status == "已停止"
+    assert workbench._completed == 1 and first["score"] == 90.0
+    assert second["status"] == "unknown" and second["id"] in workbench._selected
+    print("[PASS] Batch progress counts starts separately and stopping only reads started-task records")
+
+
 def main() -> int:
     check_py_compile()
     check_metadata_and_branding()
     check_qml_zero_warnings_and_preview()
     check_core_regressions()
     check_legacy_submission_receipt()
+    check_stopped_batch_verification()
     print("=== ALL UniCampusHelper v4.0.0 RELEASE CHECKS PASSED ===")
     return 0
 

@@ -707,12 +707,19 @@ ApplicationWindow {
                         UiText {
                             text: window.busy
                                 ? (window.appState.progress.total > 0
-                                    ? "本轮已处理 " + window.appState.progress.completed + " / " + window.appState.progress.total + " 项"
+                                    ? "已开始 " + window.appState.progress.started + " / " + window.appState.progress.total
+                                        + " 项 · 平台确认 " + window.appState.progress.completed + " 项"
                                     : window.appState.status)
                                 : summary.selectedVisible
                                     ? "已选择 " + summary.selectedVisible + " 项任务" + (voiceState.readyToUse ? " · 语音题将使用我的音色" : "")
                                     : "请在上方列表勾选要处理的任务"
                             font.pixelSize: 15; font.weight: Font.DemiBold; Layout.fillWidth: true
+                        }
+                        UiText {
+                            visible: window.busy && window.appState.progress.total > 0
+                            text: window.appState.progress.activeTask || window.appState.status
+                            elide: Text.ElideRight
+                            font.pixelSize: 12; color: Theme.muted; Layout.fillWidth: true
                         }
                         UiText {
                             objectName: "selectionDetails"
@@ -731,7 +738,7 @@ ApplicationWindow {
                         ProgressTrack {
                             visible: window.busy && window.appState.progress.total > 0
                             Layout.fillWidth: true; Layout.maximumWidth: 260; implicitHeight: 5
-                            value: window.appState.progress.completed / Math.max(1, window.appState.progress.total)
+                            value: (window.appState.progress.started || 0) / Math.max(1, window.appState.progress.total)
                         }
                     }
 
