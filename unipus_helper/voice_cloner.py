@@ -3,7 +3,7 @@
 Architecture:
   1. Capture user's reference voice via live microphone (sounddevice) or audio file import.
   2. Clean & analyze sample via FFmpeg + numpy (silence trim, mild denoise, F0 pitch estimation,
-     SNR quality score) and cache speaker embedding (`target_se.pt`) on disk under D drive.
+     SNR quality score) and cache the speaker embedding as raw float32 on disk under D drive.
   3. Generate fluent native English base speech (Edge-TTS with pitch/gender-matched neural voice,
      or textbook reference audio for follow-along/role-play tasks), then transfer speaker timbre
      using a self-contained pure-PyTorch OpenVoice V2 ToneColorConverter (MIT license, zero
@@ -15,22 +15,26 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import http.client
 import io
 import json
 import math
 import os
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
 import warnings
 import wave
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, BinaryIO, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -44,15 +48,22 @@ VOICE_PROFILES_DIR = PROJECT_ROOT / "voice_profiles"
 VOICE_MODELS_DIR = PROJECT_ROOT / "logs" / "voice_models" / "openvoice_v2"
 VOICE_TMP_DIR = PROJECT_ROOT / "logs" / "voice_tmp"
 
-OPENVOICE_V2_URLS = {
-    "config.json": [
-        "https://hf-mirror.com/myshell-ai/OpenVoiceV2/resolve/main/converter/config.json",
-        "https://huggingface.co/myshell-ai/OpenVoiceV2/resolve/main/converter/config.json",
-    ],
-    "checkpoint.pth": [
-        "https://hf-mirror.com/myshell-ai/OpenVoiceV2/resolve/main/converter/checkpoint.pth",
-        "https://huggingface.co/myshell-ai/OpenVoiceV2/resolve/main/converter/checkpoint.pth",
-    ],
+_OPENVOICE_V2_REVISION = "f36e7edfe1684461a8343844af60babc2efbb727"
+_OPENVOICE_V2_RESOLVER = f"myshell-ai/OpenVoiceV2/resolve/{_OPENVOICE_V2_REVISION}/converter"
+# File sizes are from the official repository's pinned tree. The checkpoint digest is its LFS OID.
+OPENVOICE_V2_ASSETS = {
+    "config.json": (
+        838,
+        "9dfff60350b8c63f2c664efd92a61b2516efb22671466960f0e5dfebd881fa47",
+        (f"https://hf-mirror.com/{_OPENVOICE_V2_RESOLVER}/config.json",
+         f"https://huggingface.co/{_OPENVOICE_V2_RESOLVER}/config.json"),
+    ),
+    "checkpoint.pth": (
+        131320490,
+        "9652c27e92b6b2a91632590ac9962ef7ae2b712e5c5b7f4c34ec55ee2b37ab9e",
+        (f"https://hf-mirror.com/{_OPENVOICE_V2_RESOLVER}/checkpoint.pth",
+         f"https://huggingface.co/{_OPENVOICE_V2_RESOLVER}/checkpoint.pth"),
+    ),
 }
 
 # Fluent neural Edge-TTS base voices grouped by vocal register
@@ -997,6 +1008,9 @@ class OpenVoiceV2Converter:
     def __init__(self, model_dir: Path = VOICE_MODELS_DIR):
         self.model_dir = Path(model_dir)
         self._lock = threading.RLock()
+        self._asset_lock = threading.Lock()
+        self._download_lock = threading.Lock()
+        self._asset_status: Dict[str, Tuple[Tuple[int, ...], bool]] = {}
         self._model = None
         self._cfg: Optional[Dict[str, Any]] = None
         self._device = "cpu"
@@ -1010,13 +1024,55 @@ class OpenVoiceV2Converter:
     def ckpt_path(self) -> Path:
         return self.model_dir / "checkpoint.pth"
 
-    def is_downloaded(self) -> bool:
+    @staticmethod
+    def _fingerprint(info: os.stat_result) -> Tuple[int, ...]:
+        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+    @staticmethod
+    def _matches_asset(handle: BinaryIO, info: os.stat_result, expected_size: int, expected_digest: str) -> bool:
         return (
-            self.config_path.is_file()
-            and self.config_path.stat().st_size > 200
-            and self.ckpt_path.is_file()
-            and self.ckpt_path.stat().st_size > 50_000_000
+            stat.S_ISREG(info.st_mode)
+            and info.st_size == expected_size
+            and hashlib.file_digest(handle, "sha256").hexdigest() == expected_digest
         )
+
+    def _asset_is_ready(self, name: str) -> bool:
+        path = self.model_dir / name
+        expected_size, expected_digest, _ = OPENVOICE_V2_ASSETS[name]
+        with self._asset_lock:
+            try:
+                info = path.stat()
+                if not stat.S_ISREG(info.st_mode) or info.st_size != expected_size:
+                    return False
+                signature = self._fingerprint(info)
+                cached = self._asset_status.get(name)
+                if cached and cached[0] == signature:
+                    return cached[1]
+                with path.open("rb") as handle:
+                    info = os.fstat(handle.fileno())
+                    valid = self._matches_asset(handle, info, expected_size, expected_digest)
+                    self._asset_status[name] = (self._fingerprint(info), valid)
+                return valid
+            except OSError:
+                return False
+
+    def is_downloaded(self) -> bool:
+        return all(self._asset_is_ready(name) for name in OPENVOICE_V2_ASSETS)
+
+    @contextmanager
+    def _open_verified_asset(self, name: str):
+        path = self.model_dir / name
+        expected_size, expected_digest, _ = OPENVOICE_V2_ASSETS[name]
+        if not path.is_file():
+            raise RuntimeError(f"缺少 OpenVoice V2 文件 {name}，请先下载本地模型")
+        with path.open("rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not self._matches_asset(handle, info, expected_size, expected_digest):
+                with self._asset_lock:
+                    self._asset_status.pop(name, None)
+                raise RuntimeError(f"OpenVoice V2 文件 {name} 校验失败，请重新下载本地模型")
+            handle.seek(0)
+            yield handle
 
     def model_size_mb(self) -> float:
         if not self.ckpt_path.is_file():
@@ -1029,69 +1085,101 @@ class OpenVoiceV2Converter:
         stop_event: Optional[threading.Event] = None,
     ) -> bool:
         """Download OpenVoice V2 converter weights (~125 MB) strictly into D drive."""
-        _ensure_dirs()
-        if self.is_downloaded():
+        with self._download_lock:
+            self._check_download_cancelled(stop_event)
+            if self.is_downloaded():
+                if progress_cb:
+                    progress_cb(1.0, "本地音色引擎已就绪")
+                return True
+
+            self.model_dir.mkdir(parents=True, exist_ok=True)
+            for name, (size, digest, urls) in OPENVOICE_V2_ASSETS.items():
+                self._check_download_cancelled(stop_event)
+                if self._asset_is_ready(name):
+                    continue
+                last_error = None
+                for url in urls:
+                    try:
+                        self._download_asset(name, size, digest, url, progress_cb, stop_event)
+                        break
+                    except InterruptedError:
+                        raise
+                    except (OSError, ValueError, http.client.HTTPException) as exc:
+                        last_error = exc
+                else:
+                    reason = str(last_error) if last_error else "无可用下载地址"
+                    raise RuntimeError(f"下载 {name} 失败: {reason}") from last_error
+
             if progress_cb:
-                progress_cb(1.0, "本地音色引擎已就绪")
+                progress_cb(1.0, "本地音色引擎下载完成")
             return True
 
-        for idx, (fname, urls) in enumerate(OPENVOICE_V2_URLS.items()):
-            dst = self.model_dir / fname
-            if dst.is_file() and ((fname == "config.json" and dst.stat().st_size > 200) or dst.stat().st_size > 50_000_000):
-                continue
-            tmp = self.model_dir / (fname + ".part")
-            ok = False
-            last_err = ""
-            for url in urls:
-                try:
-                    if progress_cb:
-                        progress_cb(0.02 if idx == 0 else 0.05, f"正在下载 {fname}…")
-                    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(req, timeout=60) as resp:
-                        total = int(resp.headers.get("Content-Length") or 0)
-                        done = 0
-                        last_emit = 0.0
-                        with open(tmp, "wb") as f:
-                            while True:
-                                if stop_event and stop_event.is_set():
-                                    raise InterruptedError("下载已取消")
-                                chunk = resp.read(256 * 1024)
-                                if not chunk:
-                                    break
-                                f.write(chunk)
-                                done += len(chunk)
-                                now = time.monotonic()
-                                if progress_cb and total > 0 and (now - last_emit >= 0.15 or done >= total):
-                                    frac = done / total
-                                    pct = 0.05 + 0.94 * frac if fname == "checkpoint.pth" else 0.04
-                                    mb_done = done / (1024 * 1024)
-                                    mb_tot = total / (1024 * 1024)
-                                    progress_cb(pct, f"下载音色模型 {mb_done:.1f} / {mb_tot:.1f} MB")
-                                    last_emit = now
-                    os.replace(tmp, dst)
-                    ok = True
-                    break
-                except Exception as exc:
-                    last_err = str(exc)
-                    try:
-                        if tmp.exists():
-                            tmp.unlink()
-                    except OSError:
-                        pass
-            if not ok:
-                raise RuntimeError(f"下载 {fname} 失败: {last_err}")
+    @staticmethod
+    def _check_download_cancelled(stop_event: Optional[threading.Event]) -> None:
+        if stop_event is not None and stop_event.is_set():
+            raise InterruptedError("下载已取消")
 
+    def _download_asset(
+        self,
+        name: str,
+        size: int,
+        digest: str,
+        url: str,
+        progress_cb: Optional[Callable[[float, str], None]],
+        stop_event: Optional[threading.Event],
+    ) -> None:
         if progress_cb:
-            progress_cb(1.0, "本地音色引擎下载完成")
-        return True
+            progress_cb(0.05 if name == "checkpoint.pth" else 0.02, f"正在下载 {name}…")
+        self._check_download_cancelled(stop_event)
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        sha256 = hashlib.sha256()
+        done = 0
+        last_emit = 0.0
+        tmp = None
+        try:
+            with (
+                urllib.request.urlopen(request, timeout=60) as response,
+                tempfile.NamedTemporaryFile(dir=self.model_dir, suffix=".part", delete=False) as out,
+            ):
+                tmp = Path(out.name)
+                while True:
+                    self._check_download_cancelled(stop_event)
+                    chunk = response.read(256 * 1024)
+                    self._check_download_cancelled(stop_event)
+                    if not chunk:
+                        break
+                    done += len(chunk)
+                    if done > size:
+                        raise ValueError("下载大小超过预期")
+                    out.write(chunk)
+                    sha256.update(chunk)
+                    now = time.monotonic()
+                    if progress_cb and (now - last_emit >= 0.15 or done == size):
+                        pct = 0.05 + 0.94 * done / size if name == "checkpoint.pth" else 0.04
+                        mb_done = done / (1024 * 1024)
+                        mb_total = size / (1024 * 1024)
+                        progress_cb(pct, f"下载音色模型 {mb_done:.1f} / {mb_total:.1f} MB")
+                        last_emit = now
+            if done != size or sha256.hexdigest() != digest:
+                raise ValueError("文件大小或 SHA-256 校验失败")
+            self._check_download_cancelled(stop_event)
+            os.replace(tmp, self.model_dir / name)
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
 
     def _load(self):
         with self._lock:
             if self._model is not None:
                 return
-            if not self.is_downloaded():
-                raise RuntimeError("尚未下载本地音色模型（约 125 MB）")
-            import torch
+            with self._open_verified_asset("config.json") as config:
+                cfg = json.load(config)
+
+            with self._open_verified_asset("checkpoint.pth") as checkpoint:
+                import torch
+
+                self._device = "cuda" if torch.cuda.is_available() else "cpu"
+                ckpt = torch.load(checkpoint, map_location=self._device, weights_only=True)
 
             # Keep CPU threads polite so UI and browser stay silky responsive
             try:
@@ -1100,15 +1188,12 @@ class OpenVoiceV2Converter:
             except Exception:
                 pass
 
-            self._device = "cuda" if torch.cuda.is_available() else "cpu"
-            cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
             data_cfg = cfg["data"]
             model_cfg = cfg["model"]
             spec_channels = int(data_cfg["filter_length"]) // 2 + 1
 
             model_cls = _build_openvoice_v2_classes()
             model = model_cls(spec_channels, model_cfg).to(self._device)
-            ckpt = torch.load(str(self.ckpt_path), map_location=self._device, weights_only=False)
             state_dict = ckpt.get("model", ckpt)
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
             if missing:
@@ -1574,6 +1659,9 @@ class VoiceProfileManager:
     """Manage user voice profiles: cleaning, F0 analysis, speaker embedding extraction & persistence."""
 
     DEFAULT_PROFILE_ID = "my_voice"
+    _EMBEDDING_NAME = "target_se.f32"
+    _EMBEDDING_SHAPE = (1, 256, 1)
+    _EMBEDDING_DTYPE = np.dtype("<f4")
 
     def __init__(self, profiles_dir: Path = VOICE_PROFILES_DIR):
         self.profiles_dir = Path(profiles_dir)
@@ -1582,6 +1670,34 @@ class VoiceProfileManager:
     def _profile_dir(self, profile_id: str) -> Path:
         safe = re.sub(r"[^a-zA-Z0-9_\-]", "_", (profile_id or self.DEFAULT_PROFILE_ID).strip()) or self.DEFAULT_PROFILE_ID
         return self.profiles_dir / safe
+
+    @classmethod
+    def _read_cached_embedding(cls, path: Path) -> Optional[np.ndarray]:
+        expected_size = math.prod(cls._EMBEDDING_SHAPE) * cls._EMBEDDING_DTYPE.itemsize
+        try:
+            with path.open("rb") as handle:
+                data = handle.read(expected_size + 1)
+        except OSError:
+            return None
+        if len(data) != expected_size:
+            return None
+        values = np.frombuffer(data, dtype=cls._EMBEDDING_DTYPE).reshape(cls._EMBEDDING_SHAPE)
+        return values if np.isfinite(values).all() else None
+
+    @classmethod
+    def _save_cached_embedding(cls, path: Path, embedding) -> None:
+        values = np.asarray(embedding.detach().cpu().numpy(), dtype=cls._EMBEDDING_DTYPE)
+        if values.shape != cls._EMBEDDING_SHAPE or not np.isfinite(values).all():
+            raise ValueError("提取的音色特征尺寸不符或包含无效数值")
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".part", delete=False) as handle:
+                tmp = Path(handle.name)
+                handle.write(values.tobytes())
+            os.replace(tmp, path)
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
 
     def get_profile(self, profile_id: str = DEFAULT_PROFILE_ID) -> Optional[Dict[str, Any]]:
         pdir = self._profile_dir(profile_id)
@@ -1593,12 +1709,14 @@ class VoiceProfileManager:
         except Exception:
             return None
         wav_path = pdir / "reference_clean.wav"
-        se_path = pdir / "target_se.pt"
+        se_path = pdir / self._EMBEDDING_NAME
+        has_se = self._read_cached_embedding(se_path) is not None
         meta["id"] = pdir.name
         meta["wav_path"] = str(wav_path) if wav_path.is_file() else ""
-        meta["se_path"] = str(se_path) if se_path.is_file() else ""
+        meta["se_path"] = str(se_path) if has_se else ""
         meta["has_wav"] = wav_path.is_file()
-        meta["has_se"] = se_path.is_file()
+        meta["has_se"] = has_se
+        meta["se_ready"] = has_se
         return meta
 
     def list_profiles(self) -> List[Dict[str, Any]]:
@@ -1632,7 +1750,7 @@ class VoiceProfileManager:
         pdir.mkdir(parents=True, exist_ok=True)
         raw_wav = pdir / "reference_raw.wav"
         clean_wav = pdir / "reference_clean.wav"
-        se_path = pdir / "target_se.pt"
+        se_path = pdir / self._EMBEDDING_NAME
 
         # 1. Decode original at 22050Hz mono
         raw_audio = decode_audio_to_float32(source_path, sample_rate=22050)
@@ -1667,6 +1785,7 @@ class VoiceProfileManager:
                         clean_audio = candidate
                 except Exception:
                     pass
+        se_path.unlink(missing_ok=True)
         write_wav_pcm16(clean_wav, clean_audio, 22050)
 
         # 3. Analyze F0, active duration, SNR, quality score
@@ -1676,15 +1795,9 @@ class VoiceProfileManager:
 
         # 4. Extract speaker embedding immediately if OpenVoice V2 checkpoint is ready
         se_ready = False
-        if se_path.exists():
-            try:
-                se_path.unlink()
-            except OSError:
-                pass
         if converter is not None and converter.is_downloaded():
-            import torch
             se = converter.extract_speaker_embedding(clean_audio)
-            torch.save(se.cpu(), str(se_path))
+            self._save_cached_embedding(se_path, se)
             se_ready = True
 
         meta = {
@@ -1734,21 +1847,20 @@ class VoiceProfileManager:
 
     def load_or_extract_se(self, profile_id: str, converter: OpenVoiceV2Converter):
         """Return cached target speaker embedding tensor, extracting on-demand if missing."""
-        import torch
-
         info = self.get_profile(profile_id)
         if not info or not info.get("has_wav"):
             raise RuntimeError("尚未录入使用者音色样本，请先在「我的音色」中录制或导入声音")
         pdir = self._profile_dir(profile_id)
-        se_path = pdir / "target_se.pt"
-        if se_path.is_file():
-            try:
-                return torch.load(str(se_path), map_location="cpu", weights_only=False)
-            except Exception:
-                pass
+        se_path = pdir / self._EMBEDDING_NAME
+        cached = self._read_cached_embedding(se_path)
+        if cached is not None:
+            import torch
+
+            return torch.from_numpy(cached.astype(np.float32, copy=True))
+        # Legacy .pt caches stay on disk. Rebuild exclusively from the saved reference WAV.
         clean_audio = decode_audio_to_float32(info["wav_path"], sample_rate=22050)
         se = converter.extract_speaker_embedding(clean_audio)
-        torch.save(se.cpu(), str(se_path))
+        self._save_cached_embedding(se_path, se)
         # Update metadata flag
         meta_path = pdir / "profile.json"
         try:
