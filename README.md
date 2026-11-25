@@ -1,6 +1,6 @@
 # UniCampusHelper
 
-> **v4.0.0** · 面向大学生的外语在线学习与练习辅助桌面工作台（支持新版 `ipublish / course-v3` 与旧版 `ucontent` 双播放器架构）
+> **v4.0.1** · 面向大学生的外语在线学习与练习辅助桌面工作台（支持新版 `ipublish / course-v3` 与旧版 `ucontent` 双播放器架构）
 
 - **项目主页**：[https://github.com/zhuangzztong-bit/UniCampusHelper](https://github.com/zhuangzztong-bit/UniCampusHelper)
 - **桌面界面**：PySide6 / Qt Quick 纸墨浅色系学习工作台（护眼低疲劳、任务状态一目了然）

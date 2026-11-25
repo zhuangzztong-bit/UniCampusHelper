@@ -1,7 +1,7 @@
 """Centralized application metadata for UniCampusHelper."""
 
 APP_NAME = "UniCampusHelper"
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.0.1"
 APP_TAGLINE = "大学生外语学习与练习辅助工作台"
 
 GITHUB_OWNER = "zhuangzztong-bit"

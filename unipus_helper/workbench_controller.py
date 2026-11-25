@@ -304,7 +304,7 @@ class WorkbenchController(CourseCatalogMixin):
         if self._closed.is_set() or not attempted:
             return
         if self._is_stopped():
-            unconfirmed = self._sync_tasks_from_server(attempted, after_stop=True)
+            unconfirmed = self._verify_task_records(attempted, after_stop=True)
         if unconfirmed is not None:
             self._log_task_records(attempted, unconfirmed)
         self._add_log(f"本轮开始 {len(attempted)}/{len(selected)} 项，平台确认完成 {self._completed} 项。",
@@ -313,11 +313,12 @@ class WorkbenchController(CourseCatalogMixin):
     def _is_stopped(self):
         return self._stop_requested.is_set() or (self.solver is not None and self.solver._should_stop())
 
-    def _verify_task_records(self, tasks):
-        remaining = self._sync_tasks_from_server(tasks)
-        if remaining and not self._is_stopped() and not self._stop_requested.wait(2):
+    def _verify_task_records(self, tasks, *, after_stop=False):
+        remaining = self._sync_tasks_from_server(tasks, after_stop=after_stop)
+        wait_event = self._closed if after_stop else self._stop_requested
+        if remaining and (after_stop or not self._is_stopped()) and not wait_event.wait(2):
             # 首次读取可能早于平台写入，先再读一次记录，再决定是否有补做条件。
-            latest = self._sync_tasks_from_server(tasks)
+            latest = self._sync_tasks_from_server(tasks, after_stop=after_stop)
             if latest is not None:
                 remaining = latest
         return remaining
@@ -362,7 +363,7 @@ class WorkbenchController(CourseCatalogMixin):
                 detail = "学习记录未匹配，仍待核验"
             else:
                 pending = [f'{labels.get(g["kind"], "学习项")}「{g["name"] or "未命名"}」'
-                           for g in task.get("_record_groups", [])
+                           for g in (task.get("_record_groups") or [])
                            if g["required"] and g["progress"] != 100]
                 detail = "缺平台记录的项目：" + "、".join(pending) if pending else "目录尚未确认完成"
             message = f"{name}｜{detail}"

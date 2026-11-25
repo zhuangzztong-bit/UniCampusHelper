@@ -1,4 +1,4 @@
-"""UniCampusHelper v4.0.0 release verification suite.
+"""UniCampusHelper release verification suite.
 
 Checks:
 1. All Python modules compile cleanly (py_compile).
@@ -19,7 +19,7 @@ import tempfile
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -40,7 +40,8 @@ def check_metadata_and_branding() -> None:
     from unipus_helper import meta
 
     assert meta.APP_NAME == "UniCampusHelper"
-    assert meta.APP_VERSION == "4.0.0"
+    assert re.fullmatch(r"\d+\.\d+\.\d+", meta.APP_VERSION)
+    assert f"**v{meta.APP_VERSION}**" in (ROOT / "README.md").read_text(encoding="utf-8")
     assert meta.GITHUB_OWNER == "zhuangzztong-bit"
     assert meta.GITHUB_DISPLAY == "github.com/zhuangzztong-bit/UniCampusHelper"
 
@@ -51,7 +52,7 @@ def check_metadata_and_branding() -> None:
         assert "UnipusAI-Helper" not in text, f"Legacy app name found in {qml.name}"
     theme_text = (qml_dir / "Theme.qml").read_text(encoding="utf-8")
     assert "readonly property bool dark: false" in theme_text, "Theme.qml must be light mode"
-    print("[PASS] Branding, version (v4.0.0), GitHub URL, and light-mode Theme.qml verified")
+    print(f"[PASS] Branding, version (v{meta.APP_VERSION}), GitHub URL, and light-mode Theme.qml verified")
 
 
 def check_qml_zero_warnings_and_preview() -> None:
@@ -112,9 +113,10 @@ def check_qml_zero_warnings_and_preview() -> None:
 def check_core_regressions() -> None:
     import UnipusAI_Helper as uah
     from selenium.common.exceptions import StaleElementReferenceException
+    from unipus_helper.meta import APP_VERSION
 
     assert uah.APP_NAME == "UniCampusHelper"
-    assert uah.APP_VERSION == "4.0.0"
+    assert uah.APP_VERSION == APP_VERSION
 
     # 1. Strict word bank 3-tier alignment + repair hook (Unit 4 Activity 1)
     pe = uah.PublishAnswerExecutor.__new__(uah.PublishAnswerExecutor)
@@ -253,14 +255,16 @@ def check_stopped_batch_verification() -> None:
     workbench._selected = {first["id"], second["id"]}
     workbench._total = 2
     workbench._operation = "run"
+    pending_record = dict(first, status="doing", _record_matched=False)
     platform_record = dict(first, status="done", _record_matched=True, score=90.0, progress=100)
-    with patch.object(workbench, "refresh_units_from_server", return_value=[platform_record]) as refresh:
+    with patch.object(workbench._closed, "wait", return_value=False), \
+         patch.object(workbench, "refresh_units_from_server", side_effect=[[pending_record], [platform_record]]) as refresh:
         workbench._run_operation("run", [first, second])
-        refresh.assert_called_once_with(url, {first["_unit_idx"]})
+        assert refresh.call_args_list == [call(url, {first["_unit_idx"]})] * 2
     assert solver.calls == 1 and workbench._status == "已停止"
     assert workbench._completed == 1 and first["score"] == 90.0
     assert second["status"] == "unknown" and second["id"] in workbench._selected
-    print("[PASS] Batch progress counts starts separately and stopping only reads started-task records")
+    print("[PASS] After stopping, delayed platform records are confirmed without restarting any task")
 
 
 def check_startup_diagnostics() -> None:
@@ -358,6 +362,8 @@ def check_configuration_and_run_log() -> None:
 
 
 def main() -> int:
+    from unipus_helper.meta import APP_VERSION
+
     check_py_compile()
     check_metadata_and_branding()
     check_qml_zero_warnings_and_preview()
@@ -366,7 +372,7 @@ def main() -> int:
     check_stopped_batch_verification()
     check_startup_diagnostics()
     check_configuration_and_run_log()
-    print("=== ALL UniCampusHelper v4.0.0 RELEASE CHECKS PASSED ===")
+    print(f"=== ALL UniCampusHelper v{APP_VERSION} RELEASE CHECKS PASSED ===")
     return 0
 
 

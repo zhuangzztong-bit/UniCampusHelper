@@ -125,7 +125,7 @@ ApplicationWindow {
                             Layout.fillWidth: true
                         }
                         UiText {
-                            text: "v" + (window.appState.version || "4.0.0") + " · 学习工作台"
+                            text: "v" + window.appState.version + " · 学习工作台"
                             mono: true
                             font.pixelSize: 11
                             color: Theme.muted
