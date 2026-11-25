@@ -36,10 +36,10 @@ def ensure_writable_temp_dir() -> str:
     Windows 上系统临时目录可能不可写（受限用户、策略重定向、沙箱环境等），
     此时 Chromium/Edge 启动会报
     "cannot create temp dir for unpacking extensions"。
-    这里按「系统 TEMP/TMP → tempfile 默认 → 程序目录 logs/tmp」顺序挑第一个可写的，
+    优先使用安装目录下的 logs/tmp，其后尝试系统临时目录。
     并同步写回 os.environ，供后续启动的浏览器进程继承。
     """
-    candidates = []
+    candidates = [os.path.join(BASE_DIR, 'logs', 'tmp')]
     for name in ('TEMP', 'TMP'):
         value = os.environ.get(name)
         if value and value not in candidates:
@@ -49,9 +49,6 @@ def ensure_writable_temp_dir() -> str:
         app_temp = os.path.join(local_appdata, 'UniCampusHelper', 'tmp')
         if app_temp not in candidates:
             candidates.append(app_temp)
-    program_temp = os.path.join(BASE_DIR, 'logs', 'tmp')
-    if program_temp not in candidates:
-        candidates.append(program_temp)
     workspace_temp = os.path.join(BASE_DIR, '.tmp')
     if workspace_temp not in candidates:
         candidates.append(workspace_temp)
@@ -73,7 +70,7 @@ def ensure_writable_temp_dir() -> str:
         except Exception:
             pass
         if original_temp and os.path.abspath(original_temp) != os.path.abspath(candidate):
-            print(f" 系统临时目录不可写，已切换到: {candidate}")
+            print(f" 本次运行的临时目录为 {candidate}")
         return candidate
     return ''
 
@@ -88,7 +85,9 @@ ensure_writable_temp_dir()
 
 from unipus_helper.audio_recognizer import AudioTranscriber
 from unipus_helper.browser import DEFAULT_BROWSER, driver_api, get_spec, normalize_browser
+from unipus_helper.config_store import read_config
 from unipus_helper.course_catalog import CourseCatalogMixin
+from unipus_helper.diagnostics import RedactingFormatter, redact_log
 from unipus_helper.environment_checker import EnvironmentChecker
 from unipus_helper.meta import APP_NAME, APP_VERSION, GITHUB_DISPLAY, GITHUB_URL
 from unipus_helper.task_grading import MIN_TASK_SCORE, confirmed_score, needs_live_conversation
@@ -139,15 +138,17 @@ def setup_logging():
         # 再包一层 StreamHandler，日志会自我递归直到 RecursionError
         return logger
     logger.setLevel(logging.DEBUG)
+    logger.propagate = False
     logger.handlers = []
+    redact_log.add_config_file(os.path.join(BASE_DIR, 'config.json'))
     log_dir = os.path.join(BASE_DIR, 'logs')
     os.makedirs(log_dir, exist_ok=True)
     clean_all_logs(log_dir)
-    log_file = os.path.join(log_dir, f'ucampus_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.log')
+    log_file = os.path.join(log_dir, f'ucampus_{datetime.now():%Y-%m-%d_%H-%M-%S}_{os.getpid()}.log')
 
     file_handler = logging.FileHandler(log_file, encoding='utf-8')
     file_handler.setLevel(logging.DEBUG)
-    file_formatter = logging.Formatter(
+    file_formatter = RedactingFormatter(
         '[%(asctime)s] [%(levelname)s] [%(funcName)s:%(lineno)d]\n%(message)s\n',
         datefmt='%H:%M:%S'
     )
@@ -157,14 +158,7 @@ def setup_logging():
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
 
-    class ConsoleFilter(logging.Filter):
-        def filter(self, record):
-            if record.levelno >= logging.ERROR:
-                record.msg = f" {record.msg}"
-            return True
-
-    console_handler.addFilter(ConsoleFilter())
-    console_formatter = logging.Formatter('%(message)s')
+    console_formatter = RedactingFormatter('%(message)s')
     console_handler.setFormatter(console_formatter)
     logger.addHandler(console_handler)
 
@@ -176,6 +170,7 @@ def setup_logging():
 
         def write(self, text):
             if text.strip():
+                text = redact_log(text)
                 if any(x in text for x in ['Error', 'Exception', 'Traceback']):
                     self.logger.error(text.strip())
                 elif 'Warning' in text:
@@ -227,8 +222,8 @@ class Config:
 
     @classmethod
     def from_json(cls, path: str = "config.json") -> "Config":
-        with open(path, "r", encoding="UTF-8") as f:
-            data = json.load(f)
+        data = read_config(path)
+        redact_log.add_config(data)
         global DEBUG_MODE
         DEBUG_MODE = data.get("debug_mode", False)
         try:
@@ -15806,7 +15801,9 @@ class UCampusBot:
     def _ensure_environment(self):
         checker = EnvironmentChecker(self.browser.key)
 
-        if not checker.check_all():
+        if not checker.check_all(require_ffmpeg=False):
+            if '--desktop-launch' in sys.argv or not (sys.stdin and sys.stdin.isatty()):
+                raise RuntimeError("\n".join(issue.strip() for issue in checker.issues))
             while True:
                 choice = checker.show_fix_guide()
 
@@ -16667,7 +16664,7 @@ if __name__ == '__main__':
     if not skip_check:
         print("\n 提示：")
         print("   - 首次运行需要检查环境")
-        print("   - 语音识别需要 FFmpeg（约130MB，可自动安装）")
+        print("   - 听力转写和部分音频处理需要 FFmpeg")
         print("   - 如检查通过但无法启动，使用 --skip-check 跳过")
 
     logger = setup_logging()
@@ -16689,6 +16686,8 @@ if __name__ == '__main__':
         print(f"\n 程序运行失败: {error_msg[:100]}")
         logger.error(f"程序异常: {error_msg}", exc_info=True)
         exit_code = 1
+        if '--desktop-launch' in sys.argv:
+            raise
     finally:
         if bot:
             bot.request_shutdown()

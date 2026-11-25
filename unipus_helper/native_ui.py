@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import json
 import os
 import signal
 import sys
@@ -18,6 +17,8 @@ from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 from shiboken6 import delete as delete_qt_object
 
+from .config_store import read_config, write_config
+from .diagnostics import RedactingFormatter, redact_log
 from .model_api import model_settings_error, probe_model
 from .paths import PROJECT_ROOT, QML_DIR
 from .task_grading import score_text
@@ -63,13 +64,11 @@ _INT_KEYS = frozenset({"max_tokens"})
 
 
 def load_config(path):
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        merged = dict(DEFAULT_CONFIG)
-        merged.update(cfg)
-        return merged
-    return dict(DEFAULT_CONFIG)
+    try:
+        cfg = read_config(path)
+    except FileNotFoundError:
+        cfg = {}
+    return DEFAULT_CONFIG | cfg
 
 
 def save_config(path, data: dict):
@@ -83,8 +82,8 @@ def save_config(path, data: dict):
             token = token[1:-1].strip()
         out["token_full"] = token
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2, ensure_ascii=False)
+    write_config(path, out)
+    redact_log.add_config(out)
     return True
 
 
@@ -146,7 +145,11 @@ class ConfigEditor(QObject):
         if self._api_testing:
             return
         # Always merge on top of latest disk config so voice settings edited in VoiceStudio are preserved
-        data = load_config(self.path)
+        try:
+            data = load_config(self.path)
+        except (ValueError, OSError) as exc:
+            self.saved.emit(f"读取配置失败 · {redact_log(exc)}", False)
+            return
         data.update(values)
         for key in DEFAULT_CONFIG:
             if key in _BOOL_KEYS or key in _FLOAT_KEYS or key in _INT_KEYS:
@@ -199,12 +202,14 @@ class ConfigEditor(QObject):
         self.cfg = data
         self.completed = True
         self.valuesChanged.emit()
+        message = "配置已保存" if self.first_run else "配置已保存。语音设置实时生效，模型、账号和浏览器设置重启后生效。"
         if callable(self._on_saved):
             try:
                 self._on_saved(data)
             except Exception:
-                pass
-        self.saved.emit("配置已保存" if self.first_run else "配置已保存。语音设置实时生效，模型、账号和浏览器设置重启后生效。", True)
+                logging.getLogger("UCampusBot").warning("实时应用语音配置失败", exc_info=True)
+                message = "配置已保存。请重新打开工作台以应用设置。"
+        self.saved.emit(message, True)
 
 
 def setup_first_run():
@@ -974,9 +979,13 @@ class NativeBridge(QObject):
 
     @Slot()
     def copyLogs(self):
-        QGuiApplication.clipboard().setText("\n".join(
-            f'{row["time"]}  {row["message"]}' for row in self._state["logs"]))
-        self._notice = "运行日志已复制"
+        text = self.controller.current_run_log()
+        if text is None:
+            text = "\n".join(f'{row["time"]}  {row["message"]}' for row in self._state["logs"])
+            self._notice = "运行文件不可用，已复制工作台里的日志"
+        else:
+            self._notice = "已复制本次运行日志"
+        QGuiApplication.clipboard().setText(redact_log(text))
         self.noticeChanged.emit()
 
     @Slot()
@@ -1069,13 +1078,13 @@ class NativeModernGUI(WorkbenchController):
         qt_logger.setLevel(logging.WARNING)
         qt_logger.propagate = False
         log_file = RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=1, encoding="utf-8")
-        log_file.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        log_file.setFormatter(RedactingFormatter("%(asctime)s %(levelname)s %(message)s"))
         qt_logger.addHandler(log_file)
 
         def qt_message(kind, context, message):
             if kind in (QtMsgType.QtWarningMsg, QtMsgType.QtCriticalMsg, QtMsgType.QtFatalMsg):
                 qt_logger.warning("%s:%s %s", context.file or "Qt", context.line, message)
-                print(f"Qt: {message}", file=sys.stderr)
+                print(f"Qt: {redact_log(message)}", file=sys.stderr)
 
         previous_handler = qInstallMessageHandler(qt_message)
         engine = QQmlApplicationEngine()

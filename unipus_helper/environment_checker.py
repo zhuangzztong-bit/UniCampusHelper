@@ -24,8 +24,10 @@ class EnvironmentChecker:
         # 与 driver 使用同一份规格，避免检测与实际启动的浏览器不一致
         self.browser: BrowserSpec = get_spec(browser)
 
-    def check_all(self) -> bool:
+    def check_all(self, *, require_ffmpeg: bool = True) -> bool:
         """执行完整环境检查"""
+        self.issues.clear()
+        self.warnings.clear()
         print(" 正在检查运行环境...\n")
 
         # 检查系统
@@ -34,8 +36,7 @@ class EnvironmentChecker:
         # 检查浏览器
         self._check_browser()
 
-        # 检查 FFmpeg（新增）
-        self._check_ffmpeg()
+        self._check_ffmpeg(require_ffmpeg=require_ffmpeg)
 
         # 检查结果
         if self.issues:
@@ -85,7 +86,7 @@ class EnvironmentChecker:
 
     # ==================== 新增：FFmpeg 检测 ====================
 
-    def _check_ffmpeg(self):
+    def _check_ffmpeg(self, *, require_ffmpeg: bool):
         """检查 FFmpeg 安装和 Path 配置"""
         print("   检查 FFmpeg...")
 
@@ -118,17 +119,18 @@ class EnvironmentChecker:
                 self.ffmpeg_path = path
                 self.ffprobe_path = self._resolve_ffprobe_path(path)
                 version = self._get_ffmpeg_version(path)
-                print(f"        FFmpeg 已安装但未添加到 PATH: {version}")
+                bin_dir = os.path.dirname(path)
+                os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+                print(f"        FFmpeg 已加入本次运行的 PATH: {version}")
                 print(f"         FFmpeg 路径: {path}")
                 if self.ffprobe_path:
                     print(f"         FFprobe 路径: {self.ffprobe_path}")
                 else:
                     print("         FFprobe 路径: 未检测到")
-                self.issues.append("  FFmpeg 已安装但未添加到系统环境变量 PATH")
                 return
 
-        # 未安装
-        self.issues.append(" 未检测到 FFmpeg（语音识别需要）")
+        messages = self.issues if require_ffmpeg else self.warnings
+        messages.append(" 未检测到 FFmpeg，听力转写和部分音频处理功能需要安装 FFmpeg。")
 
     def _get_ffmpeg_version(self, ffmpeg_path: str) -> str:
         """获取 FFmpeg 版本"""
@@ -137,7 +139,8 @@ class EnvironmentChecker:
                 [ffmpeg_path, "-version"],
                 capture_output=True,
                 text=True,
-                timeout=5
+                timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             # 第一行格式: ffmpeg version 6.0-full_build-www.gyan.dev
             first_line = result.stdout.split('\n')[0]

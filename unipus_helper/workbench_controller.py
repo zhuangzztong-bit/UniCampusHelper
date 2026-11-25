@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import queue
 import re
 import subprocess
@@ -10,9 +11,11 @@ import threading
 import time
 from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 from .course_catalog import CourseCatalogMixin
+from .diagnostics import redact_log
 from .model_api import probe_model
 from .task_grading import MIN_TASK_SCORE, needs_live_conversation, score_text, selectable_task
 
@@ -37,6 +40,7 @@ class WorkbenchController(CourseCatalogMixin):
         self.driver, self.solver, self.bot = driver, solver, bot
         self._globals = app_globals or {}
         self.logger = self._globals.get("logger")
+        redact_log.add_config(getattr(bot, "config", None))
         self.gui_log_queue = self._globals.get("gui_log_queue", queue.Queue())
         for name in ("WebDriverWait", "EC", "By", "NoSuchElementException", "WebDriverHelper"):
             setattr(self, name, self._globals.get(name))
@@ -95,12 +99,17 @@ class WorkbenchController(CourseCatalogMixin):
         self._add_log("账号登录成功，等待扫描课程。", "success")
 
     def _redact(self, message):
-        config = getattr(self.bot, "config", None)
-        for name in ("password", "api_key", "token_full", "username"):
-            secret = str(getattr(config, name, "") or "")
-            if secret:
-                message = str(message).replace(secret, "••••")
-        return str(message)
+        return redact_log(message)
+
+    def current_run_log(self):
+        for handler in getattr(self.logger, "handlers", ()):
+            if isinstance(handler, logging.FileHandler):
+                try:
+                    handler.flush()
+                    return Path(handler.baseFilename).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    return None
+        return None
 
     def _add_log(self, message, level="info"):
         message = self._redact(message)

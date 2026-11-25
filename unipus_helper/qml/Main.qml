@@ -436,7 +436,7 @@ ApplicationWindow {
                 ActionButton {
                     objectName: "copyLogs"; visible: window.currentPage === 2
                     enabled: (window.appState.logs || []).length > 0
-                    text: "复制全部日志"; iconName: "copy"; implicitHeight: 36
+                    text: "复制本次日志"; iconName: "copy"; implicitHeight: 36
                     onClicked: workbench.copyLogs()
                 }
             }

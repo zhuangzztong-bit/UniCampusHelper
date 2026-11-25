@@ -33,9 +33,9 @@
 
 ### 环境要求
 - Windows 10 / 11（64 位）
-- Python 3.11+（推荐 3.13）
+- Python 3.11+（推荐 3.12 或 3.13）
 - Chrome 或 Edge 浏览器
-- FFmpeg（程序启动时自动检测，缺失可按提示安装）
+- 听力转写和部分音频处理需要 FFmpeg。基础工作台可直接启动。
 
 ### 安装与运行
 ```powershell
@@ -43,14 +43,17 @@ git clone https://github.com/zhuangzztong-bit/UniCampusHelper.git
 cd UniCampusHelper
 
 python -m venv .venv
-.\.venv\Scripts\pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements-core.txt
 
-# 复制示例配置并填入你的账号与大模型 API Key（config.json 已被 .gitignore 忽略）
-Copy-Item config.example.json config.json
+# 按需安装听力转写、录音和本地音色依赖
+# .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
-# 启动桌面工作台
 .\启动-UniCampusHelper.cmd
 ```
+
+首次启动在设置页填写账号和模型接口，点击「测试连接」后保存。升级时先关闭旧工作台，再在新目录启动。已有的 `config.json` 可复制到新目录继续使用。
+
+启动失败时查看弹窗中的 `logs/startup.log`。进入工作台后，可在「运行日志」复制本次运行日志。批量处理显示已开始数与平台确认数。点停止后，工作台会查已开始任务的平台记录。
 
 ---
 
@@ -61,9 +64,11 @@ UniCampusHelper/
 ├── UnipusAI_Helper.py              # 核心引擎（双播放器解析、作答、音视频播放与重做容错）
 ├── 启动-UniCampusHelper.cmd         # Windows 一键启动脚本
 ├── config.example.json             # 脱敏配置模板（请勿提交个人 config.json）
-├── requirements.txt                # Python 依赖清单
+├── requirements-core.txt           # 基础工作台依赖
+├── requirements.txt                # 包含语音功能的依赖
 ├── scripts/
-│   └── verify_release.py           # 发布前编译、轻色 QML 与核心防回归校验脚本
+│   ├── launch_workbench.py         # Windows 启动诊断入口
+│   └── verify_release.py           # 发布前编译、QML 与核心回归检查
 └── unipus_helper/
     ├── meta.py                     # 统一元数据（应用名、版本号、GitHub 仓库地址）
     ├── native_ui.py                # PySide6 / QML 桌面窗口宿主
@@ -83,4 +88,5 @@ UniCampusHelper/
 ## 安全与开源说明
 
 - `config.json`、`config.backup-*.json`、`logs/`、`voice_profiles/` 均已写入 `.gitignore`，发布或推送代码前请再次确认未包含个人账号、密码、API Key 或录音样本。
+- 日志会隐藏已知配置凭据和常见认证参数。`config.json` 含明文凭据，请保存在本机。
 - 本项目仅供学习交流与前端自动化技术研究使用，请遵守所在院校及平台的相关规定。

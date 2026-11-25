@@ -18,6 +18,7 @@ config.real.json
 config.test.json
 config.backup-*.json
 config-backups/
+.config-*.tmp
 voice_profiles/
 *.wav
 *.mp3

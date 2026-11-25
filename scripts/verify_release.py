@@ -10,6 +10,8 @@ Checks:
 from __future__ import annotations
 
 import os
+import json
+import logging
 import py_compile
 import re
 import sys
@@ -27,7 +29,8 @@ if venv_site.is_dir():
 
 
 def check_py_compile() -> None:
-    files = [ROOT / "UnipusAI_Helper.py"] + sorted((ROOT / "unipus_helper").glob("*.py"))
+    files = ([ROOT / "UnipusAI_Helper.py"] + sorted((ROOT / "unipus_helper").glob("*.py"))
+             + sorted((ROOT / "scripts").glob("*.py")))
     for path in files:
         py_compile.compile(str(path), doraise=True)
     print(f"[PASS] py_compile: {len(files)} Python modules compiled cleanly")
@@ -260,6 +263,100 @@ def check_stopped_batch_verification() -> None:
     print("[PASS] Batch progress counts starts separately and stopping only reads started-task records")
 
 
+def check_startup_diagnostics() -> None:
+    from scripts import launch_workbench
+    from unipus_helper.environment_checker import EnvironmentChecker
+
+    checker = EnvironmentChecker()
+    with patch.object(type(checker.browser), "detect_install_path", return_value="synthetic browser"), \
+         patch("unipus_helper.environment_checker.shutil.which", return_value=None), \
+         patch("unipus_helper.environment_checker.os.path.exists", return_value=False):
+        assert checker.check_all(require_ffmpeg=False)
+        assert any("FFmpeg" in warning for warning in checker.warnings)
+        assert not checker.check_all()
+
+    with tempfile.TemporaryDirectory(prefix="ucampus-startup-check-") as folder:
+        root = Path(folder)
+        main_script = root / "UnipusAI_Helper.py"
+        main_script.write_text('raise ModuleNotFoundError("Missing UI", name="PySide6")', encoding="utf-8")
+        with patch.object(sys, "stdout", None), patch.object(sys, "stderr", None), \
+             patch.object(launch_workbench, "show_startup_error") as alert:
+            assert launch_workbench.launch(root) == 1
+        assert "PySide6" in alert.call_args.args[0] and "startup.log" in alert.call_args.args[0]
+        boot_log = root / "logs" / "startup.log"
+        assert "ModuleNotFoundError" in boot_log.read_text(encoding="utf-8")
+
+        (root / "config.json").write_text(json.dumps({"api_key": "example-startup-secret"}), encoding="utf-8")
+        main_script.write_text('raise RuntimeError("Driver failure example-startup-secret")', encoding="utf-8")
+        with patch.object(launch_workbench, "show_startup_error") as alert:
+            assert launch_workbench.launch(root) == 1
+            assert "Driver failure" in alert.call_args.args[0] and "example-startup-secret" not in alert.call_args.args[0]
+        previous = boot_log.read_text(encoding="utf-8")
+        assert "example-startup-secret" not in previous
+        main_script.write_text("raise SystemExit(0)", encoding="utf-8")
+        with patch.object(launch_workbench, "show_startup_error") as alert:
+            assert launch_workbench.launch(root) == 0
+            alert.assert_not_called()
+        assert boot_log.read_text(encoding="utf-8") == previous
+    print("[PASS] Startup without required imports reports a diagnostic, and FFmpeg is optional for core startup")
+
+
+def check_configuration_and_run_log() -> None:
+    from PySide6.QtGui import QGuiApplication
+    from unipus_helper.config_store import read_config, write_config
+    from unipus_helper.diagnostics import RedactingFormatter, redact_log
+    from unipus_helper.native_ui import NativeBridge
+    from unipus_helper.workbench_controller import WorkbenchController
+
+    with tempfile.TemporaryDirectory(prefix="ucampus-config-check-") as folder:
+        config = Path(folder) / "config.json"
+        previous = {"api_key": "synthetic-model-key", "voice_clone_api_key": "synthetic-voice-key"}
+        config.write_text(json.dumps(previous), encoding="utf-8-sig")
+        assert read_config(config) == previous
+        with patch("unipus_helper.config_store.os.replace", side_effect=PermissionError("simulated lock")):
+            try:
+                write_config(config, {"model": "custom"})
+            except PermissionError:
+                pass
+            else:
+                raise AssertionError("Expected configuration replacement failure")
+        assert read_config(config) == previous and not list(config.parent.glob(".config-*.tmp"))
+        write_config(config, dict(previous, model="custom"))
+        assert read_config(config) == dict(previous, model="custom")
+
+        app = QGuiApplication.instance() or QGuiApplication([])
+        logger = logging.Logger("synthetic-run")
+        file_handler = logging.FileHandler(Path(folder) / "run.log", encoding="utf-8")
+        file_handler.setFormatter(RedactingFormatter("%(message)s"))
+        logger.addHandler(file_handler)
+        redact_log.add_config(previous)
+        try:
+            with patch.object(threading.Thread, "start"):
+                controller = WorkbenchController(app_globals={"logger": logger})
+            logger.info("Oldest entry still present")
+            for index in range(501):
+                logger.info("Line %d", index)
+            raw_line = ("api_key='synthetic-model-key' voice: synthetic-voice-key "
+                        "https://gateway.invalid/?ticket=ST-abcd&view=menu Bearer test-header")
+            logger.warning(raw_line)
+            controller._add_log(raw_line)
+            bridge = NativeBridge(controller)
+            try:
+                bridge.copyLogs()
+                copied = app.clipboard().text()
+                on_disk = controller.current_run_log()
+                ui_line = controller.snapshot()["logs"][-1]["message"]
+                assert "Oldest entry still present" in copied and "Line 500" in copied
+                for text in (on_disk, copied, ui_line):
+                    assert "view=menu" in text
+                    assert all(secret not in text for secret in (*previous.values(), "ST-abcd", "test-header"))
+            finally:
+                bridge.timer.stop()
+        finally:
+            file_handler.close()
+    print("[PASS] Atomic configuration failure leaves old JSON intact, and disk, UI and full log exports redact credentials")
+
+
 def main() -> int:
     check_py_compile()
     check_metadata_and_branding()
@@ -267,6 +364,8 @@ def main() -> int:
     check_core_regressions()
     check_legacy_submission_receipt()
     check_stopped_batch_verification()
+    check_startup_diagnostics()
+    check_configuration_and_run_log()
     print("=== ALL UniCampusHelper v4.0.0 RELEASE CHECKS PASSED ===")
     return 0
 
