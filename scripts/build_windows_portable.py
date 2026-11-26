@@ -28,9 +28,9 @@ def sha256(path: Path) -> str:
 def build(output_dir: Path, ref: str, index_url: str, runtime_archive: Path | None) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     commit = subprocess.check_output(["git", "rev-parse", "--verify", f"{ref}^{{commit}}"], cwd=ROOT).decode().strip()
-    with tempfile.TemporaryDirectory(prefix="ucampus-build-", dir=output_dir) as scratch:
+    with tempfile.TemporaryDirectory(prefix="uc-", ignore_cleanup_errors=True) as scratch:
         stage = Path(scratch)
-        app = stage / "UniCampusHelper"
+        app = stage / "app"
         source = stage / "source.zip"
         subprocess.run(["git", "archive", "--format=zip", f"--output={source}", commit], cwd=ROOT, check=True)
         with ZipFile(source) as archive:
@@ -47,7 +47,7 @@ def build(output_dir: Path, ref: str, index_url: str, runtime_archive: Path | No
         with ZipFile(runtime_archive) as archive:
             archive.extractall(runtime)
 
-        libraries = runtime / "Lib" / "site-packages"
+        libraries = runtime / "pkgs"
         subprocess.run([
             sys.executable, "-m", "pip", "--disable-pip-version-check", "install", "--only-binary=:all:",
             "--require-hashes", "--no-compile", "--retries", "2", "--timeout", "20",
@@ -55,7 +55,7 @@ def build(output_dir: Path, ref: str, index_url: str, runtime_archive: Path | No
             "--python-version", PYTHON_VERSION, "--target", str(libraries), "--index-url", index_url,
             "-r", str(app / "requirements-windows-x64.lock"),
         ], cwd=stage, check=True)
-        (runtime / "python314._pth").write_text("python314.zip\n.\nLib/site-packages\n..\n", encoding="ascii")
+        (runtime / "python314._pth").write_text("python314.zip\n.\npkgs\n..\n", encoding="ascii")
         for command in app.glob("*.cmd"):
             command.write_text(command.read_text(encoding="utf-8"), encoding="utf-8", newline="\r\n")
 
@@ -63,14 +63,23 @@ def build(output_dir: Path, ref: str, index_url: str, runtime_archive: Path | No
             subprocess.run([str(runtime / "python.exe"), "-B", "-c",
                             "import selenium, openai, numpy; from PySide6 import QtCore, QtQml, QtQuick"],
                            cwd=app, check=True)
-        pending = stage / ASSET_NAME
-        with ZipFile(pending, "w", compression=ZIP_DEFLATED, compresslevel=5) as archive:
-            archive.comment = commit.encode("ascii")
-            for path in sorted(app.rglob("*")):
-                if path.is_file() and not path.is_relative_to(libraries / "bin") and not path.is_relative_to(libraries / "Scripts"):
-                    archive.write(path, path.relative_to(stage).as_posix())
         asset = output_dir / ASSET_NAME
-        os.replace(pending, asset)
+        pending = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=output_dir, suffix=".pending", delete=False) as stream:
+                pending = Path(stream.name)
+                with ZipFile(stream, "w", compression=ZIP_DEFLATED, compresslevel=5) as archive:
+                    archive.comment = commit.encode("ascii")
+                    for path in sorted(app.rglob("*")):
+                        if not path.is_file() or path.is_relative_to(libraries / "bin") or path.is_relative_to(libraries / "Scripts"):
+                            continue
+                        if path.suffix == ".obj" and path.is_relative_to(libraries / "PySide6"):
+                            continue  # Developer build objects are not loaded by Qt Quick.
+                        archive.write(path, f"UniCampusHelper/{path.relative_to(app).as_posix()}")
+            os.replace(pending, asset)
+        finally:
+            if pending is not None:
+                pending.unlink(missing_ok=True)
     (output_dir / f"{ASSET_NAME}.sha256").write_text(f"{sha256(asset)}  {asset.name}\n", encoding="ascii")
     return asset
 
