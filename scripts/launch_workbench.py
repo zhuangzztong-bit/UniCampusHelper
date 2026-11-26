@@ -59,9 +59,11 @@ def launch(root: Path) -> int:
         report_startup_error(root, f"工作台启动中断（退出码 {exc.code}）。")
         return 1
     except ModuleNotFoundError as exc:
+        repair = ("请重新下载并完整解压 Windows 免安装包。" if sys.executable and Path(sys.executable).parent.name == ".runtime"
+                  else "请双击「安装-UniCampusHelper.cmd」修复基础依赖。")
         report_startup_error(
             root,
-            f"缺少 Python 模块 {exc.name or '（未知）'}。请在项目目录使用当前 Python 安装 requirements-core.txt。",
+            f"缺少 Python 模块 {exc.name or '（未知）'}。{repair}",
             traceback.format_exc(),
         )
         return 1

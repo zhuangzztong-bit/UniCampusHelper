@@ -5,7 +5,7 @@ import QtQuick.Layouts
 ApplicationWindow {
     id: window
     objectName: "configWindow"
-    title: "UniCampusHelper 初始配置"
+    title: configEditor.firstRun ? "UniCampusHelper 初始配置" : "UniCampusHelper 系统配置"
     width: 820; height: 820
     minimumWidth: 640; minimumHeight: 560
     visible: true

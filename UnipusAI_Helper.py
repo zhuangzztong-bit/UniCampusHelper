@@ -84,7 +84,7 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
 ensure_writable_temp_dir()
 
 from unipus_helper.audio_recognizer import AudioTranscriber
-from unipus_helper.browser import DEFAULT_BROWSER, driver_api, get_spec, normalize_browser
+from unipus_helper.browser import DEFAULT_BROWSER, default_installed_browser, driver_api, get_spec, normalize_browser
 from unipus_helper.config_store import read_config
 from unipus_helper.course_catalog import CourseCatalogMixin
 from unipus_helper.diagnostics import RedactingFormatter, redact_log
@@ -250,7 +250,7 @@ class Config:
             tts_voice=(data.get("tts_voice") or "").strip(),
             tts_proxy=(data.get("tts_proxy") or "").strip(),
             screenshot=bool(data.get("screenshot", False)),
-            browser=normalize_browser(data.get("browser")),
+            browser=normalize_browser(data.get("browser") or default_installed_browser()),
             video_playback_rate=v_rate,
             voice_clone_enabled=bool(data.get("voice_clone_enabled", False)),
             voice_clone_mode=(data.get("voice_clone_mode") or "local").strip().lower(),
@@ -15803,7 +15803,13 @@ class UCampusBot:
 
         if not checker.check_all(require_ffmpeg=False):
             if '--desktop-launch' in sys.argv or not (sys.stdin and sys.stdin.isatty()):
-                raise RuntimeError("\n".join(issue.strip() for issue in checker.issues))
+                issues = [issue.strip() for issue in checker.issues]
+                available = default_installed_browser()
+                if available != self.browser.key and get_spec(available).detect_install_path():
+                    issues.append(f"已检测到 {get_spec(available).display_name}。可运行「配置-UniCampusHelper.cmd」，将浏览器改为 {available}。")
+                elif self.browser.manual_install_hint:
+                    issues.extend(self.browser.manual_install_hint)
+                raise RuntimeError("\n".join(issues))
             while True:
                 choice = checker.show_fix_guide()
 
@@ -16672,10 +16678,11 @@ if __name__ == '__main__':
     bot = None
     exit_code = 0
     try:
-        if not os.path.exists(os.path.join(BASE_DIR, 'config.json')):
+        settings_only = '--settings' in sys.argv
+        if settings_only or not os.path.exists(os.path.join(BASE_DIR, 'config.json')):
             from unipus_helper.native_ui import setup_first_run
             qt_app, configured = setup_first_run()
-            if not configured:
+            if settings_only or not configured:
                 sys.exit(0)
         bot = UCampusBot(os.path.join(BASE_DIR, 'config.json'), skip_check=skip_check)
         bot.start()

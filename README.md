@@ -1,6 +1,8 @@
 # UniCampusHelper
 
-> **v4.0.1** · 面向大学生的外语在线学习与练习辅助桌面工作台（支持新版 `ipublish / course-v3` 与旧版 `ucontent` 双播放器架构）
+> **v4.0.2** · 面向大学生的外语在线学习与练习辅助桌面工作台（支持新版 `ipublish / course-v3` 与旧版 `ucontent` 双播放器架构）
+
+**Windows 10/11 x64 用户**下载并完整解压 `UniCampusHelper-Windows-x64.zip`，双击 `启动-UniCampusHelper.cmd`。包内包含 Python 和基础依赖。[下载 Windows 免安装包](https://github.com/zhuangzztong-bit/UniCampusHelper/releases/latest/download/UniCampusHelper-Windows-x64.zip)
 
 - **项目主页**：[https://github.com/zhuangzztong-bit/UniCampusHelper](https://github.com/zhuangzztong-bit/UniCampusHelper)
 - **桌面界面**：PySide6 / Qt Quick 纸墨浅色系学习工作台（护眼低疲劳、任务状态一目了然）
@@ -31,29 +33,29 @@
 
 ## 快速开始
 
-### 环境要求
-- Windows 10 / 11（64 位）
-- Python 3.11+（推荐 3.12 或 3.13）
-- Chrome 或 Edge 浏览器
-- 听力转写和部分音频处理需要 FFmpeg。基础工作台可直接启动。
+### 免安装包首次使用
 
-### 安装与运行
-```powershell
-git clone https://github.com/zhuangzztong-bit/UniCampusHelper.git
-cd UniCampusHelper
+1. 使用 Windows 的「全部解压缩」，把整个文件夹放到可写的位置。保留包内的 `.runtime` 文件夹。
+2. 确认电脑装有 Microsoft Edge 或 Google Chrome，双击 `启动-UniCampusHelper.cmd`。第一次连接课程浏览器时，程序可能联网下载匹配的浏览器驱动。
+3. 在初始配置填写自己的 U 校园账号和模型服务的 API 地址、API Key、模型名称。点击「测试连接」，通过后保存。需要更换浏览器或模型时，可单独双击 `配置-UniCampusHelper.cmd`。
 
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements-core.txt
+例如使用 DeepSeek 官方接口时，可填写 `https://api.deepseek.com` 和服务商控制台显示的模型名 `deepseek-flash`。第三方网关按该网关公布的地址和模型名配置。
 
-# 按需安装听力转写、录音和本地音色依赖
-# .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+### 从源码安装
 
-.\启动-UniCampusHelper.cmd
-```
+通过仓库的 **Code → Download ZIP** 下载源码时，先完整解压，再双击 `安装-UniCampusHelper.cmd`。安装入口使用电脑上已有的 64 位 Python 3.11 或更新版本创建项目内的 `.venv`，推荐 3.12 或 3.13。失败时可查看 `logs/install.log`，并重新运行安装入口。[官方下载 Python](https://www.python.org/downloads/windows/)
 
-首次启动在设置页填写账号和模型接口，点击「测试连接」后保存。升级时先关闭旧工作台，再在新目录启动。已有的 `config.json` 可复制到新目录继续使用。
+### 听力与语音
 
-启动失败时查看弹窗中的 `logs/startup.log`。进入工作台后，可在「运行日志」复制本次运行日志。批量处理显示已开始数与平台确认数。点停止后，工作台会查已开始任务的平台记录。
+需要 Whisper 听力转写、录音或本地音色时，在装好 64 位 Python 3.12 或 3.13 后双击 `安装语音支持.cmd`。安装会下载语音依赖，Whisper 模型在首次转写时下载。使用「我的音色」时，可在界面下载 OpenVoice V2 模型。
+
+听力转写还需要 FFmpeg。下载 Windows 构建后，可将 `ffmpeg.exe`、`ffprobe.exe` 放进程序目录的 `tools/ffmpeg/bin`，或使用电脑上已经加入 `PATH` 的 FFmpeg。[FFmpeg 下载页](https://ffmpeg.org/download.html#build-windows)
+
+### 升级与排错
+
+- 升级前关闭旧窗口，再把新版解压到新目录。有需要时复制自己的 `config.json` 与 `voice_profiles` 到新目录。
+- 启动失败时看弹窗及 `logs/startup.log`。若驱动下载失败，可检查浏览器是否更新完成以及网络能否访问对应浏览器的驱动服务，然后启动重试。
+- 启动后可在「运行日志」复制本次运行日志。平台确认数来自课程记录，停止后会继续核对已开始任务的记录。
 
 ---
 
@@ -63,11 +65,15 @@ python -m venv .venv
 UniCampusHelper/
 ├── UnipusAI_Helper.py              # 核心引擎（双播放器解析、作答、音视频播放与重做容错）
 ├── 启动-UniCampusHelper.cmd         # Windows 一键启动脚本
+├── 安装-UniCampusHelper.cmd         # Windows 源码安装入口
+├── 配置-UniCampusHelper.cmd         # 独立打开设置
+├── 安装语音支持.cmd                 # 按需安装语音依赖
 ├── config.example.json             # 脱敏配置模板（请勿提交个人 config.json）
 ├── requirements-core.txt           # 基础工作台依赖
 ├── requirements.txt                # 包含语音功能的依赖
 ├── scripts/
 │   ├── launch_workbench.py         # Windows 启动诊断入口
+│   ├── build_windows_portable.py    # 从提交构建 Windows x64 免安装包
 │   └── verify_release.py           # 发布前编译、QML 与核心回归检查
 └── unipus_helper/
     ├── meta.py                     # 统一元数据（应用名、版本号、GitHub 仓库地址）

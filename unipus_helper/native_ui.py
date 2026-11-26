@@ -17,6 +17,7 @@ from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 from shiboken6 import delete as delete_qt_object
 
+from .browser import default_installed_browser
 from .config_store import read_config, write_config
 from .diagnostics import RedactingFormatter, redact_log
 from .model_api import model_settings_error, probe_model
@@ -68,6 +69,8 @@ def load_config(path):
         cfg = read_config(path)
     except FileNotFoundError:
         cfg = {}
+    if not cfg.get("browser"):
+        cfg["browser"] = default_installed_browser()
     return DEFAULT_CONFIG | cfg
 
 
@@ -216,13 +219,15 @@ def setup_first_run():
     QQuickStyle.setStyle("Basic")
     app = QGuiApplication.instance() or QGuiApplication(sys.argv[:1])
     _, mono_family = configure_ui_font(app)
-    editor = ConfigEditor(PROJECT_ROOT / "config.json", first_run=True)
+    config_path = PROJECT_ROOT / "config.json"
+    editor = ConfigEditor(config_path, first_run=not config_path.is_file())
     engine = QQmlApplicationEngine()
     engine.rootContext().setContextProperty("uiMonoFont", mono_family)
     engine.rootContext().setContextProperty("configEditor", editor)
     engine.load(QUrl.fromLocalFile(str(QML_DIR / "ConfigEditor.qml")))
     if not engine.rootObjects():
         raise RuntimeError("配置界面加载失败")
+    logging.getLogger("UCampusBot").info("配置窗口已加载")
     app.exec()
     delete_qt_object(engine)
     return app, editor.completed

@@ -146,6 +146,11 @@ CHROME = BrowserSpec(
 
 BROWSERS: Dict[str, BrowserSpec] = {spec.key: spec for spec in (EDGE, CHROME)}
 
+
+def default_installed_browser() -> str:
+    """Use an installed browser for new or legacy configurations without a choice."""
+    return next((spec.key for spec in BROWSERS.values() if spec.detect_install_path()), DEFAULT_BROWSER)
+
 # 配置里可能出现的写法，统一收敛到 key
 _ALIASES = {
     "msedge": "edge",

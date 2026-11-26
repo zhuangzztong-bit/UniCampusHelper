@@ -9,6 +9,7 @@ import urllib.request
 from typing import Optional, List
 
 from .browser import BrowserSpec, DEFAULT_BROWSER, get_spec
+from .paths import PROJECT_ROOT
 
 
 class EnvironmentChecker:
@@ -91,6 +92,10 @@ class EnvironmentChecker:
         print("   检查 FFmpeg...")
 
         # 方法1：检查系统 PATH 中是否有 ffmpeg
+        local_bin = PROJECT_ROOT / "tools" / "ffmpeg" / "bin"
+        local_ffmpeg = local_bin / "ffmpeg.exe"
+        if platform.system() == "Windows" and local_ffmpeg.is_file():
+            os.environ["PATH"] = str(local_bin) + os.pathsep + os.environ.get("PATH", "")
         ffmpeg_in_path = shutil.which("ffmpeg")
         if ffmpeg_in_path:
             self.ffmpeg_path = ffmpeg_in_path

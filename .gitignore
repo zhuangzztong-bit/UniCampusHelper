@@ -4,6 +4,8 @@ __pycache__/
 *.pyo
 .idea/
 .venv/
+.runtime/
+/tools/ffmpeg/
 venv/
 net10.0-windows/
 build/
